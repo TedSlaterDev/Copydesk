@@ -2,9 +2,9 @@
 
 **Plugin:** Editorial QA (AI Typos)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.2.0
+**Version of record:** 1.4.0
 **Requires:** WordPress 6.0+, PHP 8.0+
-**Provider:** OpenAI (Responses API)
+**Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
 This document is the specification of record for the plugin's current behavior. It reflects the shipping code in `editorial-qa.php`, `ogm-eqa-admin.js`, and `ogm-eqa-admin.css`.
 
@@ -94,7 +94,11 @@ A post must belong to an enabled post type (`post_types` setting) to trigger. A 
 
 ### 4.2 Content-hash deduplication
 
-`hash('sha256', $prepared)` is compared (via `hash_equals`) against the stored `_ogm_eqa_scanned_hash`. If equal and the scan is not forced, the job returns without calling OpenAI. On success the new hash is stored. **Effect:** re-saving unchanged content costs nothing.
+`hash('sha256', $prepared)` is compared (via `hash_equals`) against the stored `_ogm_eqa_scanned_hash`. If equal and the scan is not forced, the job returns without calling the AI provider. On success the new hash is stored. **Effect:** re-saving unchanged content costs nothing.
+
+### 4.2b Provider dispatch
+
+`scan_post_job` resolves the active provider, key, and model via `active_provider()` / `active_api_key()` / `active_model()`, then calls `call_anthropic_for_typos()` or `call_openai_for_typos()`. Both return `['report' => string]` (or a `WP_Error`); both build that string through the shared `build_report_from_issues()` so the output format is identical regardless of provider.
 
 ### 4.3 OpenAI request (`call_openai_for_typos`)
 
@@ -140,16 +144,33 @@ A post must belong to an enabled post type (`post_types` setting) to trigger. A 
 }
 ```
 
+### 4.3b Anthropic request (`call_anthropic_for_typos`)
+
+- **Endpoint:** `POST https://api.anthropic.com/v1/messages`
+- **Auth:** `x-api-key: <api_key>` + `anthropic-version: 2023-06-01`.
+- **Timeout:** 45s, via `wp_remote_post`.
+- **Body:**
+  - `model` — from settings (default `claude-haiku-4-5`; empty falls back to it).
+  - `system` — the same shared system prompt (`typo_instructions()`).
+  - `messages` — a single user turn carrying the prepared TITLE/BODY payload.
+  - `max_tokens` — `max(300, min(2000, setting))`.
+  - `output_config.format` — a `json_schema` structured output with the **same** `issues[]` shape as OpenAI, **minus the `maxLength` constraints** (an unsupported keyword the official SDKs strip client-side; the plugin uses raw HTTP so it omits them). No `strict` / `name` keys — Anthropic's format doesn't take them. GA on Haiku 4.5 / Sonnet 4.6 / Opus 4.8, so no beta header.
+
 ### 4.4 Response handling
 
-- Non-JSON body → `WP_Error`.
-- HTTP ≥ 300 → `WP_Error` carrying `error.message`.
+**OpenAI:**
+- Non-JSON body → `WP_Error`; HTTP ≥ 300 → `WP_Error` carrying `error.message`.
 - The structured payload is extracted defensively via `extract_structured_payload_fallback`, which handles several Responses API shapes: `output_json.json`, `output_json.data`, `output_text` containing JSON, top-level `output_text`, and a message-walk fallback.
-- Missing/!array `issues` → `WP_Error` with a short snippet (full response is **not** stored, for privacy).
+
+**Anthropic:**
+- Non-JSON body / HTTP ≥ 300 → `WP_Error`; `stop_reason: "refusal"` → `WP_Error`.
+- The payload is the first `text` content block, JSON-decoded.
+
+Either provider: missing/!array `issues` → `WP_Error` with a short snippet (full response is **not** stored, for privacy).
 
 ### 4.5 Report construction
 
-The human-readable report is built **server-side from validated issues only** (the model cannot inject commentary). For each issue with non-empty, differing `bad`/`good` and a valid `location`:
+The human-readable report is built **server-side from validated issues only** by the shared `build_report_from_issues()` (the model cannot inject commentary). For each issue with non-empty, differing `bad`/`good` and a valid `location`:
 
 ```
 N. LOCATION: change 'bad' to 'good'
@@ -179,31 +200,49 @@ Timestamps are stored in GMT and **displayed** converted to the site's configure
 
 | Key | Default | Notes |
 |---|---|---|
-| `api_key` | `''` | Overridden by `OGM_EQA_OPENAI_API_KEY` constant at runtime |
-| `model` | `gpt-4o-mini` | Free-text |
+| `provider` | `openai` | `openai` or `anthropic` — which API to scan with |
+| `openai_api_key` | `''` | Overridden by `OGM_EQA_OPENAI_API_KEY` constant at runtime |
+| `openai_model` | `gpt-4o-mini` | OpenAI model |
+| `anthropic_api_key` | `''` | Overridden by `OGM_EQA_ANTHROPIC_API_KEY` constant at runtime |
+| `anthropic_model` | `claude-haiku-4-5` | Anthropic model |
 | `max_output_tokens` | `350` | Sanitized to 100–2000; clamped to 300–2000 at call time |
 | `post_types` | `['post']` | Which public post types are scanned/decorated |
 | `strip_html` | `1` | Strip HTML before scanning |
 | `scan_on_schedule` | `1` | Master switch for auto-scan |
 | `scan_on_update_while_scheduled` | `1` | Rescan on future → future |
 
+**Legacy migration:** installs from ≤ 1.3.0 stored a single `api_key` / `model`
+(OpenAI). `settings()` maps these to `openai_api_key` / `openai_model` on read,
+so upgrades are seamless.
+
+Each provider's model is chosen from a dropdown populated by
+`get_model_choices($provider)`: the cached list (or the provider's
+`SEED_MODELS_*` seed list if never refreshed), always including the
+currently-saved value. The cache is **per-provider**, in a separate option:
+
+| Option | Shape |
+|---|---|
+| `ogm_eqa_models` | `['openai' => ['ids'=>string[],'updated'=>int], 'anthropic' => ['ids'=>string[],'updated'=>int]]` |
+
 ### 5.3 Constants
 
-- `OGM_EQA_VERSION` — `'1.2.0'`; used as the asset cache-buster.
-- `OGM_EQA_OPENAI_API_KEY` — optional, defined in `wp-config.php`; takes precedence over the stored key.
+- `OGM_EQA_VERSION` — `'1.4.0'`; used as the asset cache-buster.
+- `OGM_EQA_OPENAI_API_KEY` — optional `wp-config.php` constant; takes precedence over the stored OpenAI key.
+- `OGM_EQA_ANTHROPIC_API_KEY` — optional `wp-config.php` constant; takes precedence over the stored Anthropic key.
 
 ### 5.4 Hooks / identifiers
 
 - Cron/job hook: `ogm_eqa_scan_post` → `scan_post_job($post_id, $user_id, $force)`.
 - Action Scheduler group: `ogm_editorial_qa`.
 - AJAX action: `ogm_eqa_rescan` (nonce action `ogm_eqa_rescan`).
+- admin-post action: `ogm_eqa_refresh_models` → `handle_refresh_models()` (nonce `ogm_eqa_refresh_models`, cap `manage_options`).
 
 ---
 
 ## 6. Admin UI surfaces
 
 1. **Editorial QA page** (`admin.php?page=ogm-editorial-qa`, cap `edit_others_posts`) — `OGM_EQA_List_Table` with status views (Scheduled / Drafts / Pending / Published / All via `eqa_status`), search, 20/page pagination, columns Title / Status / Date / Issues / Last scan / Actions. Scheduled view sorts ascending by date; others descending.
-2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — API key, model, max tokens, post types, behavior toggles. Shows a notice when the key is being supplied by the wp-config constant.
+2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — an **AI provider** selector, then a per-provider section for **OpenAI** and for **Anthropic** (each rendered by `render_provider_section()`: API key + model dropdown + **Refresh models** button), then max tokens, post types, and behavior toggles. Both provider sections are always shown; the selector decides which is used at scan time. A per-section note appears when that provider's key is supplied by its wp-config constant. Each **Refresh models** button re-targets the settings form at `admin-post.php` (via `formaction`, carrying `name="provider"`) to call `handle_refresh_models()`, which fetches that provider's `/v1/models` (`fetch_openai_models` / `fetch_anthropic_models`), ranks/dedupes/caps the result (≤12), caches it under `ogm_eqa_models[<provider>]`, and redirects back with an `eqa_models=ok|error` + `eqa_models_provider` notice. The fetch uses the resolved key (settings or wp-config constant). Clicking Refresh does **not** save other settings changes — Save Settings is separate.
 3. **Meta box** "Editorial QA (Typos)" — registered on each enabled post type, side/high. Shows Clean/Issues badge, last-scan time (site tz), error (if any), the numbered list, and a Rescan button.
 4. **Posts list "QA" column** — inserted after Title, sortable by `_ogm_eqa_issue_count`. Shows a numeric/`!`/`—` badge and an inline Rescan button.
 
@@ -222,22 +261,24 @@ Assets (`ogm-eqa-admin.js`, `ogm-eqa-admin.css`) load only on the plugin pages, 
 
 ## 8. Cost & performance
 
-- One OpenAI request per scan; no scan when the content hash is unchanged and the scan is not forced.
+- One provider request per scan; no scan when the content hash is unchanged and the scan is not forced.
 - Background execution (Action Scheduler preferred, WP-Cron fallback) keeps the editor responsive.
-- BYOK: all usage bills to the site owner's OpenAI account.
+- BYOK: all usage bills to the site owner's account with the selected provider (OpenAI or Anthropic).
 
 ---
 
 ## 9. Known issues & roadmap
 
-Tracked items not addressed in 1.2.0:
+Tracked items not addressed in 1.4.0:
 
-1. **No uninstall/data cleanup.** Post meta (`_ogm_eqa_*`) accumulates and is never removed; there is no `uninstall.php` or deactivation cleanup. *Roadmap: optional purge on uninstall.*
-2. **Unused `quote` field.** The schema requires `quote` (near-context) and the code captures it, but the report format omits it (the "near: …" output is commented out). *Roadmap: either surface it or drop it from the schema.*
+1. **No uninstall/data cleanup.** Post meta (`_ogm_eqa_*`), the `ogm_eqa_settings` option, and the `ogm_eqa_models` cache accumulate and are never removed; there is no `uninstall.php` or deactivation cleanup. *Roadmap: optional purge on uninstall.*
+2. **Unused `quote` field.** The schema requires `quote` (near-context) and the code captures it, but the report format omits it. *Roadmap: either surface it or drop it from the schema.*
 3. **`max_output_tokens` floor mismatch.** Settings allow 100 but the request clamps to a 300 minimum, so values 100–299 are silently raised. *Roadmap: align the two bounds.*
-4. **No retry/backoff** on transient OpenAI errors (rate limits, timeouts); the error is stored and the user must Rescan. *Roadmap: limited automatic retry.*
+4. **No retry/backoff** on transient provider errors (rate limits, timeouts); the error is stored and the user must Rescan. *Roadmap: limited automatic retry.*
 5. **Direct publish is not auto-scanned** (draft → publish bypasses `future`). Intentional, but worth a settings hint or an opt-in "scan on publish".
 6. **`Tested up to`** header is a placeholder and should track the current WP release.
+
+**Resolved in 1.4.0:** dual-provider support (OpenAI **or** Anthropic) — previously item 7 on this list.
 
 ---
 
@@ -245,7 +286,7 @@ Tracked items not addressed in 1.2.0:
 
 | File | Role |
 |---|---|
-| `editorial-qa.php` | All plugin logic (class, list table, hooks, OpenAI client) |
+| `editorial-qa.php` | All plugin logic (class, list table, hooks, OpenAI + Anthropic clients) |
 | `ogm-eqa-admin.js` | Rescan button → AJAX wiring |
 | `ogm-eqa-admin.css` | Badge + meta-box list styling |
 | `README.md` | User/installer documentation (WordPress-readme style) |

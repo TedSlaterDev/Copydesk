@@ -1,8 +1,8 @@
 <?php
  /**
  * Plugin Name:       Editorial QA (AI Typos)
- * Description:       Scans scheduled posts for obvious typos via OpenAI; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.2.0
+ * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
+ * Version:           1.4.0
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,10 +15,21 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.2.0');
+define('OGM_EQA_VERSION', '1.4.0');
 
 class OGM_Editorial_QA {
-    const OPT_KEY = 'ogm_eqa_settings';
+    const OPT_KEY    = 'ogm_eqa_settings';
+    // Per-provider model cache:
+    // ['openai' => ['ids'=>string[],'updated'=>int], 'anthropic' => ['ids'=>string[],'updated'=>int]]
+    const OPT_MODELS = 'ogm_eqa_models';
+
+    const PROVIDERS = ['openai', 'anthropic'];
+
+    // Shown in each provider's model dropdown until "Refresh models" is clicked.
+    // OpenAI: Responses API + strict structured outputs.
+    const SEED_MODELS_OPENAI = ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1', 'o4-mini'];
+    // Anthropic: Messages API + structured outputs (output_config.format).
+    const SEED_MODELS_ANTHROPIC = ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-8'];
 
     const META_REPORT          = '_ogm_eqa_report';
     const META_ISSUE_COUNT     = '_ogm_eqa_issue_count';
@@ -41,32 +52,73 @@ class OGM_Editorial_QA {
 
         add_action('wp_ajax_ogm_eqa_rescan', [__CLASS__, 'ajax_rescan']);
 
+        // "Refresh models" button on the Settings page.
+        add_action('admin_post_ogm_eqa_refresh_models', [__CLASS__, 'handle_refresh_models']);
+
         // Add QA column in normal Posts list table
         add_action('admin_init', [__CLASS__, 'register_list_table_column']);
     }
 
     public static function defaults() {
         return [
-            'api_key'          => '',
-            'model'            => 'gpt-4o-mini',
-            'max_output_tokens'=> 350,
-            'post_types'       => ['post'],
-            'strip_html'       => 1,
-            'scan_on_schedule' => 1,
+            'provider'          => 'openai',
+            'openai_api_key'    => '',
+            'openai_model'      => 'gpt-4o-mini',
+            'anthropic_api_key' => '',
+            'anthropic_model'   => 'claude-haiku-4-5',
+            'max_output_tokens' => 350,
+            'post_types'        => ['post'],
+            'strip_html'        => 1,
+            'scan_on_schedule'  => 1,
             'scan_on_update_while_scheduled' => 1,
         ];
     }
 
     public static function settings() {
         $opts = get_option(self::OPT_KEY, []);
+
+        // Migrate single-provider keys from <= 1.3.0 (api_key/model were OpenAI).
+        if (isset($opts['api_key']) && !isset($opts['openai_api_key'])) {
+            $opts['openai_api_key'] = $opts['api_key'];
+        }
+        if (isset($opts['model']) && !isset($opts['openai_model'])) {
+            $opts['openai_model'] = $opts['model'];
+        }
+
         $s = wp_parse_args($opts, self::defaults());
 
-        // Prefer wp-config.php constant to keep secrets out of DB
+        // Prefer wp-config.php constants to keep secrets out of the DB.
         if (defined('OGM_EQA_OPENAI_API_KEY') && OGM_EQA_OPENAI_API_KEY) {
-            $s['api_key'] = OGM_EQA_OPENAI_API_KEY;
+            $s['openai_api_key'] = OGM_EQA_OPENAI_API_KEY;
+        }
+        if (defined('OGM_EQA_ANTHROPIC_API_KEY') && OGM_EQA_ANTHROPIC_API_KEY) {
+            $s['anthropic_api_key'] = OGM_EQA_ANTHROPIC_API_KEY;
         }
 
         return $s;
+    }
+
+    /** Active provider, sanitized to a known value. */
+    public static function active_provider($s) {
+        $p = (string)($s['provider'] ?? 'openai');
+        return in_array($p, self::PROVIDERS, true) ? $p : 'openai';
+    }
+
+    /** Resolved API key for the active provider (settings or wp-config constant). */
+    private static function active_api_key($s) {
+        return self::active_provider($s) === 'anthropic'
+            ? trim((string)($s['anthropic_api_key'] ?? ''))
+            : trim((string)($s['openai_api_key'] ?? ''));
+    }
+
+    /** Selected model for the active provider, with a sane fallback. */
+    private static function active_model($s) {
+        if (self::active_provider($s) === 'anthropic') {
+            $m = trim((string)($s['anthropic_model'] ?? ''));
+            return $m !== '' ? $m : 'claude-haiku-4-5';
+        }
+        $m = trim((string)($s['openai_model'] ?? ''));
+        return $m !== '' ? $m : 'gpt-4o-mini';
     }
 
     /** --------- Triggering scans --------- */
@@ -128,8 +180,14 @@ class OGM_Editorial_QA {
         if (!$post || !($post instanceof WP_Post)) return;
 
         $s = self::settings();
-        if (empty($s['api_key'])) {
-            self::store_error($post_id, 'Missing API key. Configure it in Editorial QA → Settings, or define OGM_EQA_OPENAI_API_KEY in wp-config.php.');
+
+        $provider = self::active_provider($s);
+        $api_key  = self::active_api_key($s);
+        $model    = self::active_model($s);
+
+        if ($api_key === '') {
+            $const = $provider === 'anthropic' ? 'OGM_EQA_ANTHROPIC_API_KEY' : 'OGM_EQA_OPENAI_API_KEY';
+            self::store_error($post_id, sprintf('Missing %s API key. Configure it in Editorial QA → Settings, or define %s in wp-config.php.', ucfirst($provider), $const));
             return;
         }
 
@@ -148,10 +206,10 @@ class OGM_Editorial_QA {
 
         delete_post_meta($post_id, self::META_ERROR);
 
-        $model = trim((string)$s['model']);
-        if ($model === '') $model = 'gpt-4o-mini';
-
-        $result = self::call_openai_for_typos($prepared, $s['api_key'], $model, (int)$s['max_output_tokens']);
+        $max_tokens = (int)$s['max_output_tokens'];
+        $result = ($provider === 'anthropic')
+            ? self::call_anthropic_for_typos($prepared, $api_key, $model, $max_tokens)
+            : self::call_openai_for_typos($prepared, $api_key, $model, $max_tokens);
 
         if (is_wp_error($result)) {
             self::store_error($post_id, $result->get_error_message());
@@ -228,11 +286,9 @@ class OGM_Editorial_QA {
         return "TITLE:\n{$title}\n\nBODY:\n{$content}\n";
     }
 
-private static function call_openai_for_typos($text, $api_key, $model, $max_output_tokens) {
-    $endpoint = 'https://api.openai.com/v1/responses';
-
-    // Keep instructions short; the schema is the real enforcement.
-    $instructions = <<<SYS
+/** Shared system prompt for both providers. Schema is the real enforcement. */
+private static function typo_instructions() {
+    return <<<SYS
 Return ONLY structured JSON that matches the provided schema.
 Detect ONLY objective technical typos:
 - Misspellings
@@ -242,6 +298,12 @@ Detect ONLY objective technical typos:
 - Do NOT provide any corrections relating to quotation marks or apostrophes, either curly or straight. Do NOT mention any of these characters: " ' “ ” ‘ ’
 No commentary. No "no correction needed". No political/tone/style remarks.
 SYS;
+}
+
+private static function call_openai_for_typos($text, $api_key, $model, $max_output_tokens) {
+    $endpoint = 'https://api.openai.com/v1/responses';
+
+    $instructions = self::typo_instructions();
 
 $body = [
     'model' => $model,
@@ -345,44 +407,133 @@ $body = [
         return new WP_Error('ogm_eqa_bad_structured', 'Structured payload missing issues[]. Payload snippet: ' . $snippet);
     }
 
-// Build your numbered list from validated issues only (no commentary possible).
+    return ['report' => self::build_report_from_issues($payload['issues'])];
+}
+
+/**
+ * Build the numbered, human-readable report from validated issues only
+ * (no model commentary can leak through). Shared by both providers.
+ */
+private static function build_report_from_issues($issues) {
     $lines = [];
     $n = 1;
 
-    foreach ($payload['issues'] as $iss) {
-        $loc   = isset($iss['location']) ? (string)$iss['location'] : '';
-        $bad   = isset($iss['bad']) ? trim((string)$iss['bad']) : '';
-        $good  = isset($iss['good']) ? trim((string)$iss['good']) : '';
-        $quote = isset($iss['quote']) ? trim((string)$iss['quote']) : '';
+    foreach ((array)$issues as $iss) {
+        if (!is_array($iss)) continue;
 
-        // Only actionable changes
-        if ($bad === '' || $good === '' || $bad === $good) {
-            continue;
-        }
-        if ($loc !== 'TITLE' && $loc !== 'BODY') {
-            continue;
-        }
+        $loc  = isset($iss['location']) ? (string)$iss['location'] : '';
+        $bad  = isset($iss['bad']) ? trim((string)$iss['bad']) : '';
+        $good = isset($iss['good']) ? trim((string)$iss['good']) : '';
 
-        // Safety: keep output compact and consistent
-        $bad_esc   = str_replace(["\r","\n"], [' ',' '], $bad);
-        $good_esc  = str_replace(["\r","\n"], [' ',' '], $good);
-        $quote_esc = str_replace(["\r","\n"], [' ',' '], $quote);
+        // Only actionable changes.
+        if ($bad === '' || $good === '' || $bad === $good) continue;
+        if ($loc !== 'TITLE' && $loc !== 'BODY') continue;
 
-        $lines[] = sprintf(
-            //"%d. %s: change '%s' to '%s' (near: '%s')",
-            "%d. %s: change '%s' to '%s'",
-            $n,
-            $loc,
-            $bad_esc,
-            $good_esc,
-            $quote_esc
-        );
+        // Keep output compact and consistent.
+        $bad_esc  = str_replace(["\r", "\n"], [' ', ' '], $bad);
+        $good_esc = str_replace(["\r", "\n"], [' ', ' '], $good);
+
+        $lines[] = sprintf("%d. %s: change '%s' to '%s'", $n, $loc, $bad_esc, $good_esc);
         $n++;
     }
 
-    $report = $lines ? implode("\n", $lines) : "No obvious typos detected.";
+    return $lines ? implode("\n", $lines) : 'No obvious typos detected.';
+}
 
-    return ['report' => $report];
+/**
+ * Anthropic Messages API typo scan. Uses structured outputs
+ * (output_config.format json_schema) — GA on Haiku 4.5 / Sonnet 4.6 / Opus 4.8.
+ * Note: raw HTTP, so the schema omits maxLength (an unsupported constraint the
+ * official SDKs strip client-side).
+ */
+private static function call_anthropic_for_typos($text, $api_key, $model, $max_output_tokens) {
+    $endpoint = 'https://api.anthropic.com/v1/messages';
+
+    $body = [
+        'model'      => $model,
+        'max_tokens' => max(300, min(2000, (int)$max_output_tokens)),
+        'system'     => self::typo_instructions(),
+        'messages'   => [
+            ['role' => 'user', 'content' => $text],
+        ],
+        'output_config' => [
+            'format' => [
+                'type'   => 'json_schema',
+                'schema' => [
+                    'type' => 'object',
+                    'additionalProperties' => false,
+                    'properties' => [
+                        'issues' => [
+                            'type'  => 'array',
+                            'items' => [
+                                'type' => 'object',
+                                'additionalProperties' => false,
+                                'properties' => [
+                                    'location' => ['type' => 'string', 'enum' => ['TITLE', 'BODY']],
+                                    'type'     => [
+                                        'type' => 'string',
+                                        'enum' => ['spelling', 'duplicate_word', 'broken_capitalization', 'broken_punctuation'],
+                                    ],
+                                    'quote' => ['type' => 'string'],
+                                    'bad'   => ['type' => 'string'],
+                                    'good'  => ['type' => 'string'],
+                                ],
+                                'required' => ['location', 'type', 'quote', 'bad', 'good'],
+                            ],
+                        ],
+                    ],
+                    'required' => ['issues'],
+                ],
+            ],
+        ],
+    ];
+
+    $resp = wp_remote_post($endpoint, [
+        'timeout' => 45,
+        'headers' => [
+            'x-api-key'         => trim($api_key),
+            'anthropic-version' => '2023-06-01',
+            'content-type'      => 'application/json',
+        ],
+        'body' => wp_json_encode($body),
+    ]);
+    if (is_wp_error($resp)) return $resp;
+
+    $code = (int) wp_remote_retrieve_response_code($resp);
+    $raw  = (string) wp_remote_retrieve_body($resp);
+
+    $json = json_decode($raw, true);
+    if (!is_array($json)) {
+        return new WP_Error('ogm_eqa_bad_json', 'Anthropic returned non-JSON response.');
+    }
+
+    if ($code < 200 || $code >= 300) {
+        $msg = $json['error']['message'] ?? ('Anthropic error (HTTP ' . $code . ').');
+        return new WP_Error('ogm_eqa_http_error', sanitize_text_field($msg));
+    }
+
+    if (($json['stop_reason'] ?? '') === 'refusal') {
+        return new WP_Error('ogm_eqa_refusal', 'Anthropic declined to process this content.');
+    }
+
+    // Structured output arrives as the first text content block (JSON string).
+    $out_text = '';
+    if (!empty($json['content']) && is_array($json['content'])) {
+        foreach ($json['content'] as $block) {
+            if (is_array($block) && ($block['type'] ?? '') === 'text' && isset($block['text'])) {
+                $out_text = (string)$block['text'];
+                break;
+            }
+        }
+    }
+
+    $payload = json_decode(trim($out_text), true);
+    if (!is_array($payload) || !isset($payload['issues']) || !is_array($payload['issues'])) {
+        $snippet = mb_substr($raw, 0, 400);
+        return new WP_Error('ogm_eqa_bad_structured', 'Anthropic response could not be parsed as structured JSON. Snippet: ' . $snippet);
+    }
+
+    return ['report' => self::build_report_from_issues($payload['issues'])];
 }
 
     private static function extract_output_text_fallback(array $json) {
@@ -496,9 +647,16 @@ $body = [
         $d = self::defaults();
         $out = [];
 
-        // If you define OGM_EQA_OPENAI_API_KEY, this field is ignored at runtime, but we still store it if set.
-        $out['api_key'] = isset($input['api_key']) ? trim((string)$input['api_key']) : '';
-        $out['model']   = isset($input['model']) ? sanitize_text_field((string)$input['model']) : $d['model'];
+        $prov = isset($input['provider']) ? sanitize_key((string)$input['provider']) : $d['provider'];
+        $out['provider'] = in_array($prov, self::PROVIDERS, true) ? $prov : $d['provider'];
+
+        // API keys are ignored at runtime if the matching wp-config constant is
+        // defined, but we still store whatever was entered.
+        $out['openai_api_key']    = isset($input['openai_api_key']) ? trim((string)$input['openai_api_key']) : '';
+        $out['anthropic_api_key'] = isset($input['anthropic_api_key']) ? trim((string)$input['anthropic_api_key']) : '';
+
+        $out['openai_model']    = isset($input['openai_model']) ? sanitize_text_field((string)$input['openai_model']) : $d['openai_model'];
+        $out['anthropic_model'] = isset($input['anthropic_model']) ? sanitize_text_field((string)$input['anthropic_model']) : $d['anthropic_model'];
 
         $out['max_output_tokens'] = isset($input['max_output_tokens']) ? max(100, min(2000, absint($input['max_output_tokens']))) : $d['max_output_tokens'];
 
@@ -583,30 +741,46 @@ $body = [
         echo '<div class="wrap">';
         echo '<h1>Editorial QA Settings</h1>';
 
-        if (defined('OGM_EQA_OPENAI_API_KEY') && OGM_EQA_OPENAI_API_KEY) {
-            echo '<div class="notice notice-info"><p><strong>API key is being provided by wp-config.php</strong> via <code>OGM_EQA_OPENAI_API_KEY</code>. The field below is ignored at runtime.</p></div>';
+        // Result notice from the "Refresh models" button (provider-aware).
+        $models_notice   = isset($_GET['eqa_models']) ? sanitize_key(wp_unslash($_GET['eqa_models'])) : '';
+        $models_provider = isset($_GET['eqa_models_provider']) ? sanitize_key(wp_unslash($_GET['eqa_models_provider'])) : '';
+        $models_count    = isset($_GET['eqa_models_count']) ? (int) $_GET['eqa_models_count'] : 0;
+        $prov_label      = $models_provider === 'anthropic' ? 'Anthropic' : 'OpenAI';
+        if ($models_notice === 'ok') {
+            echo '<div class="notice notice-success is-dismissible"><p>'
+                . esc_html(sprintf('%s models refreshed — %d available in the dropdown.', $prov_label, $models_count))
+                . '</p></div>';
+        } elseif ($models_notice === 'error') {
+            echo '<div class="notice notice-error is-dismissible"><p>'
+                . esc_html(sprintf('Could not refresh %s models. Save the API key first, then check ', $prov_label))
+                . '<code>wp-content/debug.log</code> for the exact error.</p></div>';
         }
 
         echo '<form method="post" action="options.php">';
         settings_fields(self::OPT_KEY);
 
+        // Nonce for the "Refresh models" buttons, which re-target this same
+        // form at admin-post.php via formaction.
+        wp_nonce_field('ogm_eqa_refresh_models', 'ogm_eqa_refresh_models_nonce');
+
         echo '<table class="form-table" role="presentation">';
 
+        // Provider selector.
+        $provider = self::active_provider($s);
         echo '<tr>';
-        echo '<th scope="row"><label for="ogm-eqa-api-key">OpenAI API key</label></th>';
+        echo '<th scope="row"><label for="ogm-eqa-provider">AI provider</label></th>';
         echo '<td>';
-        echo '<input id="ogm-eqa-api-key" name="' . esc_attr(self::OPT_KEY) . '[api_key]" type="password" class="regular-text" value="' . esc_attr($s['api_key']) . '" autocomplete="off" />';
-        echo '<p class="description">Stored in wp_options unless you define <code>OGM_EQA_OPENAI_API_KEY</code> in wp-config.php.</p>';
+        echo '<select id="ogm-eqa-provider" name="' . esc_attr(self::OPT_KEY) . '[provider]">';
+        echo '<option value="openai"' . selected($provider, 'openai', false) . '>OpenAI</option>';
+        echo '<option value="anthropic"' . selected($provider, 'anthropic', false) . '>Anthropic (Claude)</option>';
+        echo '</select>';
+        echo '<p class="description">Which API to use for scanning. Configure that provider&rsquo;s key and model below.</p>';
         echo '</td>';
         echo '</tr>';
 
-        echo '<tr>';
-        echo '<th scope="row"><label for="ogm-eqa-model">Model</label></th>';
-        echo '<td>';
-        echo '<input id="ogm-eqa-model" name="' . esc_attr(self::OPT_KEY) . '[model]" type="text" class="regular-text" value="' . esc_attr($s['model']) . '" />';
-        echo '<p class="description">Example: gpt-4o-mini</p>';
-        echo '</td>';
-        echo '</tr>';
+        // Per-provider key + model + refresh.
+        self::render_provider_section($s, 'openai');
+        self::render_provider_section($s, 'anthropic');
 
         echo '<tr>';
         echo '<th scope="row"><label for="ogm-eqa-max-tokens">Max output tokens</label></th>';
@@ -642,6 +816,58 @@ $body = [
         submit_button('Save Settings');
         echo '</form>';
         echo '</div>';
+    }
+
+    /** Render one provider's API key + model dropdown + "Refresh models" button. */
+    private static function render_provider_section($s, $provider) {
+        $is_anthropic = ($provider === 'anthropic');
+        $label     = $is_anthropic ? 'Anthropic' : 'OpenAI';
+        $key_field = $is_anthropic ? 'anthropic_api_key' : 'openai_api_key';
+        $mdl_field = $is_anthropic ? 'anthropic_model'   : 'openai_model';
+        $const     = $is_anthropic ? 'OGM_EQA_ANTHROPIC_API_KEY' : 'OGM_EQA_OPENAI_API_KEY';
+        $const_set = defined($const) && constant($const);
+        $eg        = $is_anthropic ? 'e.g. claude-haiku-4-5' : 'e.g. gpt-4o-mini';
+        $id_key    = 'ogm-eqa-' . $provider . '-key';
+        $id_mdl    = 'ogm-eqa-' . $provider . '-model';
+
+        // API key row.
+        echo '<tr>';
+        echo '<th scope="row"><label for="' . esc_attr($id_key) . '">' . esc_html($label) . ' API key</label></th>';
+        echo '<td>';
+        echo '<input id="' . esc_attr($id_key) . '" name="' . esc_attr(self::OPT_KEY) . '[' . esc_attr($key_field) . ']" type="password" class="regular-text" value="' . esc_attr((string)($s[$key_field] ?? '')) . '" autocomplete="off" />';
+        if ($const_set) {
+            echo '<p class="description">Provided by <code>' . esc_html($const) . '</code> in wp-config.php — this field is ignored at runtime.</p>';
+        } else {
+            echo '<p class="description">Stored in wp_options unless you define <code>' . esc_html($const) . '</code> in wp-config.php.</p>';
+        }
+        echo '</td>';
+        echo '</tr>';
+
+        // Model row + refresh button.
+        echo '<tr>';
+        echo '<th scope="row"><label for="' . esc_attr($id_mdl) . '">' . esc_html($label) . ' model</label></th>';
+        echo '<td>';
+
+        $choices = self::get_model_choices($provider);
+        $current = (string)($s[$mdl_field] ?? '');
+        echo '<select id="' . esc_attr($id_mdl) . '" name="' . esc_attr(self::OPT_KEY) . '[' . esc_attr($mdl_field) . ']">';
+        foreach ($choices as $mc) {
+            echo '<option value="' . esc_attr($mc) . '"' . selected($current, $mc, false) . '>' . esc_html($mc) . '</option>';
+        }
+        echo '</select> ';
+
+        $refresh_url = add_query_arg('action', 'ogm_eqa_refresh_models', admin_url('admin-post.php'));
+        echo '<button type="submit" class="button" name="provider" value="' . esc_attr($provider) . '" formaction="' . esc_url($refresh_url) . '" formnovalidate>Refresh ' . esc_html($label) . ' models</button>';
+
+        $updated = self::models_updated($provider);
+        if ($updated) {
+            echo '<p class="description">Model list refreshed ' . esc_html(human_time_diff($updated, time())) . ' ago (' . esc_html($eg) . ').</p>';
+        } else {
+            echo '<p class="description">Showing a default list (' . esc_html($eg) . '). Save the ' . esc_html($label) . ' API key, then click <strong>Refresh ' . esc_html($label) . ' models</strong>.</p>';
+        }
+
+        echo '</td>';
+        echo '</tr>';
     }
 
     /** --------- Meta box --------- */
@@ -822,6 +1048,288 @@ echo '<p style="line-height:1.3;">Note that sometimes AI gets it wrong, and one 
         self::queue_scan($post_id, get_current_user_id(), true);
 
         wp_send_json_success(['message' => 'Rescan queued. Refresh in a few seconds.']);
+    }
+
+    /** --------- Model list (dropdown + refresh) --------- */
+
+    /** Seed model list for a provider (shown before any refresh). */
+    private static function seed_models($provider) {
+        return $provider === 'anthropic' ? self::SEED_MODELS_ANTHROPIC : self::SEED_MODELS_OPENAI;
+    }
+
+    /** Cached model entry for a provider: ['ids'=>string[], 'updated'=>int]. */
+    private static function models_cache($provider) {
+        $all = get_option(self::OPT_MODELS, []);
+        $entry = (is_array($all) && isset($all[$provider]) && is_array($all[$provider])) ? $all[$provider] : [];
+        return [
+            'ids'     => (isset($entry['ids']) && is_array($entry['ids'])) ? array_values(array_filter(array_map('strval', $entry['ids']))) : [],
+            'updated' => isset($entry['updated']) ? (int)$entry['updated'] : 0,
+        ];
+    }
+
+    /** Last-refresh timestamp for a provider (0 if never). */
+    private static function models_updated($provider) {
+        return self::models_cache($provider)['updated'];
+    }
+
+    /**
+     * Options for a provider's model dropdown: the cached list (or the seed
+     * list if never refreshed), always including the currently-saved model.
+     *
+     * @return string[]
+     */
+    private static function get_model_choices($provider) {
+        $ids = self::models_cache($provider)['ids'];
+        if (!$ids) $ids = self::seed_models($provider);
+
+        // Keep the saved model selectable even if it isn't in the fetched/seed list.
+        $s = self::settings();
+        $current = trim((string)($provider === 'anthropic' ? ($s['anthropic_model'] ?? '') : ($s['openai_model'] ?? '')));
+        if ($current !== '' && !in_array($current, $ids, true)) {
+            array_unshift($ids, $current);
+        }
+        return $ids;
+    }
+
+    /**
+     * admin-post handler for the "Refresh models" buttons. Calls the chosen
+     * provider's /v1/models endpoint, filters + ranks the results, and caches
+     * them per-provider so the dropdown can be populated from it.
+     */
+    public static function handle_refresh_models() {
+        if (!current_user_can('manage_options')) {
+            wp_die('Sorry, you are not allowed to do that.', '', ['response' => 403]);
+        }
+        check_admin_referer('ogm_eqa_refresh_models', 'ogm_eqa_refresh_models_nonce');
+
+        $redirect = admin_url('admin.php?page=ogm-editorial-qa-settings');
+        $s        = self::settings();
+
+        $provider = isset($_POST['provider']) ? sanitize_key(wp_unslash($_POST['provider'])) : '';
+        if (!in_array($provider, self::PROVIDERS, true)) {
+            wp_safe_redirect(add_query_arg('eqa_models', 'error', $redirect));
+            exit;
+        }
+
+        try {
+            if ($provider === 'anthropic') {
+                $api_key = trim((string)($s['anthropic_api_key'] ?? ''));
+                $models  = self::rank_anthropic_models(self::fetch_anthropic_models($api_key));
+            } else {
+                $api_key = trim((string)($s['openai_api_key'] ?? ''));
+                $models  = self::rank_openai_models(self::fetch_openai_models($api_key));
+            }
+            if (!$models) {
+                throw new \RuntimeException('No compatible models returned.');
+            }
+
+            $all = get_option(self::OPT_MODELS, []);
+            if (!is_array($all)) $all = [];
+            $all[$provider] = ['ids' => $models, 'updated' => time()];
+            update_option(self::OPT_MODELS, $all);
+        } catch (\Throwable $e) {
+            error_log("Editorial QA model refresh failed ($provider): " . $e->getMessage());
+            wp_safe_redirect(add_query_arg(
+                ['eqa_models' => 'error', 'eqa_models_provider' => $provider],
+                $redirect
+            ));
+            exit;
+        }
+
+        wp_safe_redirect(add_query_arg([
+            'eqa_models'          => 'ok',
+            'eqa_models_provider' => $provider,
+            'eqa_models_count'    => count($models),
+        ], $redirect));
+        exit;
+    }
+
+    /**
+     * GET https://api.openai.com/v1/models — returns chat-capable model IDs.
+     *
+     * @return string[]
+     * @throws \RuntimeException on missing key / transport / HTTP error.
+     */
+    private static function fetch_openai_models($api_key) {
+        if ($api_key === '') {
+            throw new \RuntimeException('OpenAI API key not configured. Save the key first, then refresh.');
+        }
+
+        $resp = wp_remote_get('https://api.openai.com/v1/models', [
+            'timeout' => 15,
+            'headers' => ['Authorization' => 'Bearer ' . $api_key],
+        ]);
+        if (is_wp_error($resp)) {
+            throw new \RuntimeException('Transport error: ' . $resp->get_error_message());
+        }
+        $code = (int) wp_remote_retrieve_response_code($resp);
+        $body = (string) wp_remote_retrieve_body($resp);
+        if ($code < 200 || $code >= 300) {
+            throw new \RuntimeException("HTTP $code: " . substr($body, 0, 300));
+        }
+        $data = json_decode($body, true);
+        if (!is_array($data) || empty($data['data']) || !is_array($data['data'])) {
+            throw new \RuntimeException('Unexpected response shape: ' . substr($body, 0, 300));
+        }
+
+        // Allowlist chat/Responses-capable families; blocklist non-text and
+        // deprecated lines (embeddings, audio, image, fine-tunes, etc.).
+        $blocklist = [
+            'embedding', 'audio', 'tts', 'whisper', 'image', 'moderation',
+            'realtime', 'transcribe', 'instruct', 'davinci', 'curie',
+            'babbage', 'ada', 'search', 'similarity', 'edit', '-ft-', ':ft-',
+        ];
+
+        $ids = [];
+        foreach ($data['data'] as $m) {
+            if (empty($m['id'])) continue;
+            $id = (string) $m['id'];
+
+            $is_chat = preg_match('/^o\d/i', $id)
+                || strpos($id, 'gpt-') === 0
+                || strpos($id, 'chatgpt-') === 0;
+            if (!$is_chat) continue;
+
+            $skip = false;
+            foreach ($blocklist as $needle) {
+                if (stripos($id, $needle) !== false) { $skip = true; break; }
+            }
+            if (!$skip) $ids[] = $id;
+        }
+        return $ids;
+    }
+
+    /**
+     * Sort OpenAI chat-model IDs most-capable → least, collapse near-duplicate
+     * snapshots to the canonical family head, and cap the list.
+     *
+     * @param string[] $ids
+     * @return string[]
+     */
+    private static function rank_openai_models(array $ids) {
+        $score_for = function ($id) {
+            $id = strtolower($id);
+            if (preg_match('/^o4(?!-mini)/', $id)) return 105;
+            if (preg_match('/^o3(?!-mini)/', $id)) return 100;
+            if (preg_match('/^o1(?!-mini)/', $id)) return 90;
+            if (preg_match('/^o4-mini/', $id))     return 72;
+            if (preg_match('/^o3-mini/', $id))     return 70;
+            if (preg_match('/^o1-mini/', $id))     return 65;
+            if (strpos($id, 'gpt-5')       === 0) return 95;
+            if (strpos($id, 'gpt-4.5')     === 0) return 85;
+            if (strpos($id, 'gpt-4.1-mini')=== 0) return 58;
+            if (strpos($id, 'gpt-4.1')     === 0) return 82;
+            if (strpos($id, 'gpt-4o-mini') === 0) return 55;
+            if (strpos($id, 'gpt-4o')      === 0) return 80;
+            if (strpos($id, 'gpt-4-turbo') === 0) return 75;
+            if (strpos($id, 'gpt-4')       === 0) return 60;
+            if (strpos($id, 'gpt-3.5')     === 0) return 40;
+            if (strpos($id, 'chatgpt-')    === 0) return 50;
+            return 30;
+        };
+
+        $variant_penalty = function ($id) {
+            $p = 0;
+            if (preg_match('/-\d{4}-\d{2}-\d{2}/', $id)) $p += 3; // dated snapshot
+            if (stripos($id, 'preview') !== false)       $p += 5;
+            if (stripos($id, 'realtime') !== false)      $p += 8;
+            if (stripos($id, 'audio') !== false)         $p += 8;
+            if (stripos($id, 'search') !== false)        $p += 6;
+            return $p;
+        };
+
+        $scored = [];
+        foreach ($ids as $id) {
+            $scored[] = ['id' => $id, 'score' => $score_for($id) - $variant_penalty($id), 'tie' => $id];
+        }
+        usort($scored, function ($a, $b) {
+            if ($a['score'] !== $b['score']) return $b['score'] - $a['score'];
+            return strcmp($a['tie'], $b['tie']);
+        });
+
+        // Collapse dated/preview snapshots to one entry per family head.
+        $seen = [];
+        $out  = [];
+        foreach ($scored as $row) {
+            $fam = preg_replace('/-\d{4}.*$/', '', $row['id']);
+            $fam = preg_replace('/-preview.*$/i', '', $fam);
+            if (isset($seen[$fam])) continue;
+            $seen[$fam] = true;
+            $out[] = $row['id'];
+            if (count($out) >= 12) break;
+        }
+        return $out;
+    }
+
+    /**
+     * GET https://api.anthropic.com/v1/models — returns claude-* model IDs.
+     *
+     * @return string[]
+     * @throws \RuntimeException on missing key / transport / HTTP error.
+     */
+    private static function fetch_anthropic_models($api_key) {
+        if ($api_key === '') {
+            throw new \RuntimeException('Anthropic API key not configured. Save the key first, then refresh.');
+        }
+
+        $resp = wp_remote_get('https://api.anthropic.com/v1/models?limit=100', [
+            'timeout' => 15,
+            'headers' => [
+                'x-api-key'         => $api_key,
+                'anthropic-version' => '2023-06-01',
+            ],
+        ]);
+        if (is_wp_error($resp)) {
+            throw new \RuntimeException('Transport error: ' . $resp->get_error_message());
+        }
+        $code = (int) wp_remote_retrieve_response_code($resp);
+        $body = (string) wp_remote_retrieve_body($resp);
+        if ($code < 200 || $code >= 300) {
+            throw new \RuntimeException("HTTP $code: " . substr($body, 0, 300));
+        }
+        $data = json_decode($body, true);
+        if (!is_array($data) || empty($data['data']) || !is_array($data['data'])) {
+            throw new \RuntimeException('Unexpected response shape: ' . substr($body, 0, 300));
+        }
+
+        $ids = [];
+        foreach ($data['data'] as $m) {
+            if (!empty($m['id']) && strpos((string)$m['id'], 'claude-') === 0) {
+                $ids[] = (string) $m['id'];
+            }
+        }
+        return $ids;
+    }
+
+    /**
+     * Sort Anthropic model IDs most-capable → least (opus > sonnet > haiku),
+     * dedupe, and cap the list. Newer dated snapshots sort first within a family.
+     *
+     * @param string[] $ids
+     * @return string[]
+     */
+    private static function rank_anthropic_models(array $ids) {
+        $family_score = ['opus' => 30, 'sonnet' => 20, 'haiku' => 10];
+
+        $scored = [];
+        foreach ($ids as $id) {
+            $score = 0;
+            foreach ($family_score as $fam => $pts) {
+                if (stripos($id, $fam) !== false) { $score += $pts; break; }
+            }
+            $scored[] = ['id' => $id, 'score' => $score, 'tie' => $id];
+        }
+        usort($scored, function ($a, $b) {
+            if ($a['score'] !== $b['score']) return $b['score'] - $a['score'];
+            return strcmp($b['tie'], $a['tie']); // newer dated snapshots sort first
+        });
+
+        $out = [];
+        foreach ($scored as $row) {
+            if (!in_array($row['id'], $out, true)) $out[] = $row['id'];
+            if (count($out) >= 12) break;
+        }
+        return $out;
     }
 }
 
