@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.7.0
+**Stable tag:** 1.7.1
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -109,6 +109,10 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 
 ## Changelog
 
+### 1.7.1
+- **Fewer capitalization false positives.** The scanner no longer suggests lowercasing the first letter of a word, so correctly-capitalized proper nouns, acronyms, and headings (e.g. "White House", "WATCH:") are left alone — both via a stricter prompt and a server-side guard.
+- **Better structure handling.** Embedded `<script>`/`<style>` (e.g. video players) are removed before scanning, and paragraph/heading line breaks are preserved, so separate blocks like a "WATCH:" label and the next paragraph are no longer glued into one line (which used to read as a false capitalization error).
+
 ### 1.7.0
 - **Refresh models now runs over AJAX** — the dropdown updates in place, errors show inline (never a blank page), and pressing Enter in a field saves settings instead of accidentally triggering a refresh.
 - Added a **"Create a key"** link beside each provider's API-key field (platform.openai.com / console.anthropic.com).
@@ -146,6 +150,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 - Structured-output typo scanning via the OpenAI Responses API; admin page, meta box, and Posts list column.
 
 ## Upgrade Notice
+
+### 1.7.1
+Reduces capitalization false positives (proper nouns, headings) and stops embedded scripts / lost line breaks from creating bogus "issues". No settings change required.
 
 ### 1.7.0
 Fixes the "Refresh models" button (now AJAX-based, with inline errors), adds per-provider key-creation links, and labels the Posts-list column "Issues". No settings migration required.

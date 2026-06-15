@@ -2,7 +2,7 @@
 
 **Plugin:** Editorial QA (AI Typos)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.7.0
+**Version of record:** 1.7.1
 **Requires:** WordPress 6.0+, PHP 8.0+
 **Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
@@ -87,12 +87,14 @@ A post must belong to an enabled post type (`post_types` setting) to trigger.
 
 1. `strip_shortcodes()` on the body.
 2. Remove all `<blockquote>…</blockquote>` content (regex, dot-all, case-insensitive).
-3. Optionally `wp_strip_all_tags()` (the `strip_html` setting; on by default).
-4. `html_entity_decode()` (ENT_QUOTES | ENT_HTML5) on title and body.
-5. Unicode NFC normalization (`normalizer_normalize`) when `intl` is available.
-6. Strip zero-width / invisible characters (`U+200B–200D`, `U+FEFF`).
-7. Collapse runs of spaces/tabs; collapse 3+ newlines to 2; trim.
-8. Emit a single payload string: `"TITLE:\n{title}\n\nBODY:\n{body}\n"`.
+3. Remove `<script>`/`<style>` blocks **with their contents** — always, even when `strip_html` is off (embed code is never proofreadable text).
+4. Convert block-level boundaries (`<br>`, `</p>`, `</div>`, `</h1–6>`, `</li>`, …) to newlines, so separate paragraphs/headings stay on separate lines.
+5. Optionally `wp_strip_all_tags($content, false)` (the `strip_html` setting; on by default). The `false` **keeps line breaks** — collapsing them (the old `true`) glued e.g. a "WATCH:" heading to the next paragraph and produced false mid-sentence capitalization flags.
+6. `html_entity_decode()` (ENT_QUOTES | ENT_HTML5) on title and body.
+7. Unicode NFC normalization (`normalizer_normalize`) when `intl` is available.
+8. Strip zero-width / invisible characters (`U+200B–200D`, `U+FEFF`).
+9. Collapse runs of spaces/tabs; collapse 3+ newlines to 2; trim.
+10. Emit a single payload string: `"TITLE:\n{title}\n\nBODY:\n{body}\n"`.
 
 ### 4.2 Content-hash deduplication
 
@@ -178,6 +180,8 @@ The human-readable report is built **server-side from validated issues only** by
 ```
 N. LOCATION: change 'bad' to 'good'
 ```
+
+Issues are additionally dropped by `is_unwanted_case_change()` when the change is **case-only** and lowercases a **word-initial** capital (proper nouns, acronyms, headings, sentence/line starts) — the scanner can't distinguish those from real errors. Mid-word case fixes (`thE`→`the`) and capitalizing a word (`paris`→`Paris`) are unaffected. The prompt also instructs the model not to produce these.
 
 If no actionable issues remain, the report is the literal `"No obvious typos detected."`. Issue count is derived by `count_numbered_issues` (counts lines matching `^\d+[.)]\s`); a report containing "no obvious typos detected" forces count `0`.
 

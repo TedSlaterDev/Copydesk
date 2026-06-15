@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.7.0
+ * Version:           1.7.1
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.7.0');
+define('OGM_EQA_VERSION', '1.7.1');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -274,7 +274,7 @@ class OGM_Editorial_QA {
         $content = (string)$content;
 
         $content = strip_shortcodes($content);
-        
+
 		// Remove ALL blockquote content (leave other HTML intact for later stripping/decoding)
 		$content = preg_replace(
 			'#<blockquote\b[^>]*>.*?</blockquote>#is',
@@ -282,8 +282,21 @@ class OGM_Editorial_QA {
 			$content
 		);
 
+		// Remove <script>/<style> blocks WITH their contents — embed code
+		// (e.g. video players) is never proofreadable text. Always, even when
+		// "Strip HTML" is off, so embeds can't leak into the scan.
+		$content = preg_replace('#<(script|style)\b[^>]*>.*?</\1>#is', '', $content);
+
+		// Convert block-level boundaries to newlines BEFORE stripping tags, so
+		// separate paragraphs/headings stay on separate lines. Otherwise a
+		// heading like "WATCH:" and the next paragraph collapse into one line
+		// ("WATCH: Later …") and read as a mid-sentence capitalization error.
+		$content = preg_replace('#<br\s*/?>#i', "\n", $content);
+		$content = preg_replace('#</(?:p|div|h[1-6]|li|tr|section|article|header|footer|figure|figcaption|blockquote)>#i', "\n", $content);
+
         if ($strip_html) {
-            $content = wp_strip_all_tags($content, true);
+            // false = keep line breaks (the whitespace pass below normalizes them).
+            $content = wp_strip_all_tags($content, false);
         }
 
 		$content = html_entity_decode($content, ENT_QUOTES | ENT_HTML5, get_bloginfo('charset') ?: 'UTF-8');
@@ -349,9 +362,10 @@ Return ONLY structured JSON that matches the provided schema.
 Detect ONLY objective technical typos:
 - Misspellings
 - Duplicated words ("the the")
-- Clearly broken capitalization ("thE", random mid-word caps). Do NOT enforce title case/headline style.
+- Broken capitalization ONLY when a capital letter appears in the MIDDLE of a word ("thE", "wOrld"). NEVER suggest lowercasing the first letter of a word. Proper nouns (names, places, brands, organizations such as "White House"), acronyms, all-caps labels/headings (e.g. "WATCH:"), and the first word of any sentence or line are correctly capitalized — do NOT flag them. Do NOT enforce title case or headline style. When unsure about capitalization, do not report it.
 - Clearly broken punctuation ("??", "!!", "..")
 - Do NOT provide any corrections relating to quotation marks or apostrophes, either curly or straight. Do NOT mention any of these characters: " ' “ ” ‘ ’
+The text preserves line breaks. A capitalized word at the start of a line begins a new heading or paragraph — never treat it as a mid-sentence error, even if the previous line ended without a period.
 No commentary. No "no correction needed". No political/tone/style remarks.
 SYS;
 }
@@ -475,6 +489,11 @@ private static function build_report_from_issues($issues) {
         if ($bad === '' || $good === '' || $bad === $good) continue;
         if ($loc !== 'TITLE' && $loc !== 'BODY') continue;
 
+        // Drop unhelpful capitalization "fixes" that lowercase a word's first
+        // letter (proper nouns, headings, sentence/line starts). The scanner
+        // can't tell these from real errors, so they're almost always wrong.
+        if (self::is_unwanted_case_change($bad, $good)) continue;
+
         // Keep output compact and consistent.
         $bad_esc  = str_replace(["\r", "\n"], [' ', ' '], $bad);
         $good_esc = str_replace(["\r", "\n"], [' ', ' '], $good);
@@ -484,6 +503,33 @@ private static function build_report_from_issues($issues) {
     }
 
     return $lines ? implode("\n", $lines) : 'No obvious typos detected.';
+}
+
+/**
+ * True when `$good` differs from `$bad` only by case AND it lowercases the
+ * first letter of a word — i.e. an unwanted downcasing of a proper noun,
+ * heading, acronym, or sentence/line start. Mid-word case fixes ("thE"→"the")
+ * and capitalizing a word ("paris"→"Paris") are NOT affected.
+ */
+private static function is_unwanted_case_change($bad, $good) {
+    if (mb_strtolower($bad) !== mb_strtolower($good)) {
+        return false; // not a pure case change (different letters)
+    }
+    $bw = preg_split('/\s+/u', trim($bad), -1, PREG_SPLIT_NO_EMPTY);
+    $gw = preg_split('/\s+/u', trim($good), -1, PREG_SPLIT_NO_EMPTY);
+    if (!$bw || count($bw) !== count($gw)) {
+        return true; // odd case-only change — drop to be safe
+    }
+    foreach ($bw as $i => $bword) {
+        $b0 = mb_substr($bword, 0, 1);
+        $g0 = mb_substr($gw[$i], 0, 1);
+        if ($b0 === $g0) continue;
+        // bad's word starts with an uppercase letter that good lowercases.
+        if ($b0 === mb_strtoupper($b0) && $b0 !== mb_strtolower($b0) && $g0 === mb_strtolower($b0)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
