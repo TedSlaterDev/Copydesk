@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.5.0
+ * Version:           1.6.0
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.5.0');
+define('OGM_EQA_VERSION', '1.6.0');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -76,9 +76,11 @@ class OGM_Editorial_QA {
             'max_output_tokens' => 350,
             'post_types'        => ['post'],
             'strip_html'        => 1,
-            'scan_on_schedule'  => 1,
-            'scan_on_update_while_scheduled' => 1,
-            'scan_on_publish'   => 0,
+            // Post statuses whose entry triggers a scan. Default: Scheduled.
+            'trigger_statuses'  => ['future'],
+            // Also re-scan when a post is saved again while already in a
+            // trigger status (content-hash dedup avoids redundant API calls).
+            'rescan_on_update'  => 1,
         ];
     }
 
@@ -91,6 +93,22 @@ class OGM_Editorial_QA {
         }
         if (isset($opts['model']) && !isset($opts['openai_model'])) {
             $opts['openai_model'] = $opts['model'];
+        }
+
+        // Migrate <= 1.5.0 boolean triggers to the trigger_statuses list.
+        if (!isset($opts['trigger_statuses'])) {
+            $ts = [];
+            // scan_on_schedule defaulted on, so treat "unset" as on.
+            if (!isset($opts['scan_on_schedule']) || !empty($opts['scan_on_schedule'])) {
+                $ts[] = 'future';
+            }
+            if (!empty($opts['scan_on_publish'])) {
+                $ts[] = 'publish';
+            }
+            $opts['trigger_statuses'] = $ts;
+            if (!isset($opts['rescan_on_update']) && isset($opts['scan_on_update_while_scheduled'])) {
+                $opts['rescan_on_update'] = $opts['scan_on_update_while_scheduled'] ? 1 : 0;
+            }
         }
 
         $s = wp_parse_args($opts, self::defaults());
@@ -139,25 +157,19 @@ class OGM_Editorial_QA {
         $post_types = (array)($s['post_types'] ?? []);
         if (!in_array($post->post_type, $post_types, true)) return;
 
-        // 1) When scheduling (anything -> future)
-        $is_schedule_event = !empty($s['scan_on_schedule']) && ($new_status === 'future' && $old_status !== 'future');
+        // Only act when the post's NEW status is one the user chose to scan on.
+        $statuses = (array)($s['trigger_statuses'] ?? []);
+        if (!in_array($new_status, $statuses, true)) return;
 
-        // 2) When updating a scheduled post (future -> future) (optional)
-        $is_update_while_scheduled = !empty($s['scan_on_schedule']) && !empty($s['scan_on_update_while_scheduled'])
-            && $new_status === 'future' && $old_status === 'future';
+        // Fire on transition INTO a selected status, or — if enabled — on a
+        // re-save while already in one. The content hash dedups unchanged
+        // re-saves, so this won't waste API calls.
+        $entered = ($old_status !== $new_status);
+        $resaved = ($old_status === $new_status) && !empty($s['rescan_on_update']);
+        if (!$entered && !$resaved) return;
 
-        // 3) On publish, e.g. a post published directly without scheduling (optional).
-        // future -> publish is included but harmless: the content hash dedups it
-        // against the scan already done at scheduling time.
-        $is_publish_event = !empty($s['scan_on_publish']) && $new_status === 'publish' && $old_status !== 'publish';
-
-        if (!$is_schedule_event && !$is_update_while_scheduled && !$is_publish_event) return;
-
-        // Who initiated it?
-        $user_id = get_current_user_id();
-
-        // Queue scan (async)
-        self::queue_scan($post->ID, $user_id, false);
+        // Queue scan (async).
+        self::queue_scan($post->ID, get_current_user_id(), false);
     }
 
     public static function queue_scan($post_id, $user_id = 0, $force = false) {
@@ -690,9 +702,13 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $out['max_output_tokens'] = isset($input['max_output_tokens']) ? max(self::MIN_TOKENS, min(self::MAX_TOKENS, absint($input['max_output_tokens']))) : $d['max_output_tokens'];
 
         $out['strip_html'] = empty($input['strip_html']) ? 0 : 1;
-        $out['scan_on_schedule'] = empty($input['scan_on_schedule']) ? 0 : 1;
-        $out['scan_on_update_while_scheduled'] = empty($input['scan_on_update_while_scheduled']) ? 0 : 1;
-        $out['scan_on_publish'] = empty($input['scan_on_publish']) ? 0 : 1;
+        $out['rescan_on_update'] = empty($input['rescan_on_update']) ? 0 : 1;
+
+        // Trigger statuses: keep only valid, non-internal registered statuses.
+        $valid_statuses = array_keys(get_post_stati(['internal' => false]));
+        $ts = isset($input['trigger_statuses']) ? (array)$input['trigger_statuses'] : [];
+        $ts = array_values(array_intersect(array_map('sanitize_key', $ts), $valid_statuses));
+        $out['trigger_statuses'] = $ts;
 
         $pts = isset($input['post_types']) ? (array)$input['post_types'] : $d['post_types'];
         $pts = array_values(array_filter(array_map('sanitize_key', $pts)));
@@ -816,14 +832,18 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
                 . esc_html(sprintf('%s models refreshed — %d available in the dropdown.', $prov_label, $models_count))
                 . '</p></div>';
         } elseif ($models_notice === 'error') {
-            echo '<div class="notice notice-error is-dismissible"><p>'
-                . esc_html(sprintf('Could not refresh %s models. Save the API key first, then check ', $prov_label))
-                . '<code>wp-content/debug.log</code> for the exact error.</p></div>';
+            $detail = self::take_refresh_error();
+            echo '<div class="notice notice-error is-dismissible"><p>';
+            echo esc_html(sprintf('Could not refresh %s models.', $prov_label));
+            echo $detail !== ''
+                ? ' ' . esc_html($detail)
+                : esc_html(' Make sure the API key is saved, then try again.');
+            echo '</p></div>';
         }
 
         echo '<div class="ogm-eqa-layout">';
         echo '<div class="ogm-eqa-main"><div class="ogm-eqa-card">';
-        echo '<p class="ogm-eqa-intro">Pick a provider, add your API key, and choose a model. Scans run automatically in the background when a post is scheduled.</p>';
+        echo '<p class="ogm-eqa-intro">Pick a provider, add your API key, and choose a model. Scans run automatically in the background when a post enters one of the statuses you choose below.</p>';
 
         echo '<form method="post" action="options.php">';
         settings_fields(self::OPT_KEY);
@@ -855,6 +875,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<th scope="row"><label for="ogm-eqa-max-tokens">Max output tokens</label></th>';
         echo '<td>';
         echo '<input id="ogm-eqa-max-tokens" name="' . esc_attr(self::OPT_KEY) . '[max_output_tokens]" type="number" min="' . esc_attr(self::MIN_TOKENS) . '" max="' . esc_attr(self::MAX_TOKENS) . '" value="' . esc_attr((int)$s['max_output_tokens']) . '" />';
+        echo '<p class="description">Caps how long the AI&rsquo;s reply can be for a <strong>single</strong> scan — i.e. how many typos it can list for one post. It is <strong>not</strong> a daily or monthly budget. The default (350) holds dozens of findings; only raise it if very long posts get cut off.</p>';
         echo '</td>';
         echo '</tr>';
 
@@ -872,12 +893,26 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '</tr>';
 
         echo '<tr>';
+        echo '<th scope="row">Scan triggers</th>';
+        echo '<td>';
+        echo '<p class="description" style="margin:0 0 4px;">Scan a post when it <strong>enters</strong> one of these statuses:</p>';
+        $sel_statuses = (array)($s['trigger_statuses'] ?? []);
+        foreach (get_post_stati(['internal' => false], 'objects') as $sk => $sobj) {
+            $checked = in_array($sk, $sel_statuses, true) ? 'checked' : '';
+            echo '<label style="display:block;margin:2px 0;">';
+            echo '<input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[trigger_statuses][]" value="' . esc_attr($sk) . '" ' . $checked . ' /> ';
+            echo esc_html($sobj->label) . ' <code>' . esc_html($sk) . '</code>';
+            echo '</label>';
+        }
+        echo '<label style="display:block;margin:10px 0 2px;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[rescan_on_update]" value="1" ' . checked(1, (int)$s['rescan_on_update'], false) . ' /> Also re-scan when an already-eligible post is edited and saved again</label>';
+        echo '<p class="description">Tip: each scan is one API call, but unchanged content is skipped automatically — so re-saves rarely cost anything.</p>';
+        echo '</td>';
+        echo '</tr>';
+
+        echo '<tr>';
         echo '<th scope="row">Behavior</th>';
         echo '<td>';
         echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[strip_html]" value="1" ' . checked(1, (int)$s['strip_html'], false) . ' /> Strip HTML before scanning</label>';
-        echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[scan_on_schedule]" value="1" ' . checked(1, (int)$s['scan_on_schedule'], false) . ' /> Scan when a post is scheduled</label>';
-        echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[scan_on_update_while_scheduled]" value="1" ' . checked(1, (int)$s['scan_on_update_while_scheduled'], false) . ' /> Rescan when a scheduled post is updated (future → future)</label>';
-        echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[scan_on_publish]" value="1" ' . checked(1, (int)$s['scan_on_publish'], false) . ' /> Also scan on publish (catches posts published directly, without scheduling)</label>';
         echo '</td>';
         echo '</tr>';
 
@@ -910,7 +945,8 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<li><span class="label">Provider</span><span class="value">' . esc_html($label) . '</span></li>';
         echo '<li><span class="label">Model</span><span class="value"><code>' . esc_html($model ?: '—') . '</code></span></li>';
         echo '<li><span class="ogm-eqa-dot ' . ($key_set ? 'is-on' : '') . '"></span><span class="label">API key</span><span class="value">' . ($key_set ? 'Configured' : 'Not set') . '</span></li>';
-        echo '<li><span class="ogm-eqa-dot ' . (!empty($s['scan_on_schedule']) ? 'is-on' : '') . '"></span><span class="label">Auto-scan</span><span class="value">' . (!empty($s['scan_on_schedule']) ? 'On' : 'Off') . '</span></li>';
+        $trigger_count = count((array)($s['trigger_statuses'] ?? []));
+        echo '<li><span class="ogm-eqa-dot ' . ($trigger_count ? 'is-on' : '') . '"></span><span class="label">Auto-scan</span><span class="value">' . ($trigger_count ? esc_html(sprintf('%d status%s', $trigger_count, $trigger_count === 1 ? '' : 'es')) : 'Off') . '</span></li>';
         echo '</ul>';
         echo '</div>';
 
@@ -1202,6 +1238,24 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
      * provider's /v1/models endpoint, filters + ranks the results, and caches
      * them per-provider so the dropdown can be populated from it.
      */
+    /** Stash a short, per-user reason for a failed model refresh (shown once). */
+    private static function set_refresh_error($message) {
+        $message = trim(wp_strip_all_tags((string)$message));
+        if ($message === '') return;
+        set_transient('ogm_eqa_refresh_error_' . get_current_user_id(), mb_substr($message, 0, 200), 2 * MINUTE_IN_SECONDS);
+    }
+
+    /** Read + clear the stashed refresh error for the current user. */
+    private static function take_refresh_error() {
+        $key = 'ogm_eqa_refresh_error_' . get_current_user_id();
+        $msg = get_transient($key);
+        if ($msg !== false) {
+            delete_transient($key);
+            return (string)$msg;
+        }
+        return '';
+    }
+
     public static function handle_refresh_models() {
         if (!current_user_can('manage_options')) {
             wp_die('Sorry, you are not allowed to do that.', '', ['response' => 403]);
@@ -1213,6 +1267,7 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
 
         $provider = isset($_POST['provider']) ? sanitize_key(wp_unslash($_POST['provider'])) : '';
         if (!in_array($provider, self::PROVIDERS, true)) {
+            self::set_refresh_error('Unknown provider in the refresh request.');
             wp_safe_redirect(add_query_arg('eqa_models', 'error', $redirect));
             exit;
         }
@@ -1226,7 +1281,7 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
                 $models  = self::rank_openai_models(self::fetch_openai_models($api_key));
             }
             if (!$models) {
-                throw new \RuntimeException('No compatible models returned.');
+                throw new \RuntimeException('No compatible models were returned by the provider.');
             }
 
             $all = get_option(self::OPT_MODELS, []);
@@ -1235,6 +1290,7 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
             update_option(self::OPT_MODELS, $all);
         } catch (\Throwable $e) {
             error_log("Editorial QA model refresh failed ($provider): " . $e->getMessage());
+            self::set_refresh_error($e->getMessage());
             wp_safe_redirect(add_query_arg(
                 ['eqa_models' => 'error', 'eqa_models_provider' => $provider],
                 $redirect

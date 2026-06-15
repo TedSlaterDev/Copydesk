@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.5.0
+**Stable tag:** 1.6.0
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -68,7 +68,13 @@ For reliable background processing, install [Action Scheduler](https://actionsch
 
 ### When does a scan run automatically?
 
-When a post transitions into the **scheduled** (`future`) status, and — if enabled — each time an already-scheduled post is updated. There's also an optional **Also scan on publish** setting that catches posts published directly (draft → publish) without being scheduled. With that off, use the **Rescan** button for directly-published posts.
+You choose. On the Settings page, the **Scan triggers** section lists every post status registered on your site — Draft, Pending review, Scheduled, Published, Private, plus any custom editorial-workflow statuses (e.g. "Approved"). A post is scanned whenever it **enters** one of the statuses you've ticked. The default is just **Scheduled**.
+
+Optionally enable **re-scan on update** to also scan when an already-eligible post is edited and saved again. Either way, unchanged content is skipped via a content hash, and the **Rescan** button always works on demand.
+
+### What is "Max output tokens"?
+
+It caps how long the AI's reply can be for a **single** scan — i.e. how many typos it can list for one post. It is **not** a daily or monthly budget or a cost cap over time. The default (350) comfortably holds dozens of findings; only raise it if a very long post has its typo list cut off.
 
 ### Does it change my content?
 
@@ -103,6 +109,11 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 
 ## Changelog
 
+### 1.6.0
+- **Configurable scan triggers.** Instead of only scanning scheduled posts, you can now pick any post status(es) that should trigger a scan — Draft, Pending review, Scheduled, Published, Private, or any custom editorial-workflow status registered on your site. Existing settings are migrated automatically (Scheduled stays on by default).
+- The **Refresh models** button now shows the exact reason on screen when it fails (missing key, HTTP 401, connectivity, …) instead of a generic/blank error.
+- Clarified the **Max output tokens** field with inline help — it's the per-scan reply length, not a spending budget.
+
 ### 1.5.0
 - **Refreshed admin design.** Both Editorial QA screens now share a branded header with Reports/Settings tabs, a card-based layout, a settings sidebar (at-a-glance status + key links), and the Orchard Grove Media visual style.
 - **New "Also scan on publish" option** — optionally scan posts that are published directly, without being scheduled first.
@@ -130,6 +141,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 - Structured-output typo scanning via the OpenAI Responses API; admin page, meta box, and Posts list column.
 
 ## Upgrade Notice
+
+### 1.6.0
+Scan triggers are now per-status and configurable. Your previous schedule/publish settings are migrated automatically, so behavior is unchanged until you adjust them. Also fixes the "Refresh models" error to show a real message.
 
 ### 1.5.0
 Refreshed admin UI, an optional "scan on publish" trigger, uninstall cleanup, and automatic retry on transient provider errors. No reconfiguration required.
