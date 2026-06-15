@@ -1,0 +1,21 @@
+.ogm-eqa-badge{
+  display:inline-block;
+  min-width: 22px;
+  padding: 2px 8px;
+  border-radius: 2px;
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 18px;
+  text-align:center;
+}
+.ogm-eqa-badge-good{ background:#e7f7ed; color:#146c2e; border:1px solid #b7e3c6; }
+.ogm-eqa-badge-bad{ background:#fde8e8; color:#b32d2e; border:1px solid #f5b5b5; }
+
+/* Editorial QA meta box: numbered typo list */
+ol.ogm-eqa-list { margin-left: 1.3em; }
+ol.ogm-eqa-list li::marker {
+  font-weight: bold;
+  color: #b32d2e;
+  font-size: 1.1em;
+}
+ol.ogm-eqa-list span { color: #777; }

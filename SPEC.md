@@ -1,0 +1,252 @@
+# Editorial QA (AI Typos) — Technical Specification
+
+**Plugin:** Editorial QA (AI Typos)
+**Author:** Orchard Grove Media, LLC
+**Version of record:** 1.2.0
+**Requires:** WordPress 6.0+, PHP 8.0+
+**Provider:** OpenAI (Responses API)
+
+This document is the specification of record for the plugin's current behavior. It reflects the shipping code in `editorial-qa.php`, `ogm-eqa-admin.js`, and `ogm-eqa-admin.css`.
+
+---
+
+## 1. Purpose & scope
+
+Editorial QA detects **objective, technical typos** in WordPress posts and surfaces them in wp-admin so a human can fix them before publication. It is a proofreading *assistant*, not an auto-corrector — it never modifies post content.
+
+### In scope (the only things it flags)
+
+| Type (`type` enum) | Examples |
+|---|---|
+| `spelling` | misspelled words |
+| `duplicate_word` | "the the", "and and" |
+| `broken_capitalization` | "thE", random mid-word caps |
+| `broken_punctuation` | "??", "!!", ".." |
+
+### Explicitly out of scope (never flagged)
+
+- Quotation marks and apostrophes — curly or straight (the model is instructed not to mention `"` `'` `“` `”` `‘` `’`).
+- Title case / headline style.
+- Tone, grammar preference, style, political/editorial judgment.
+- Anything inside a `<blockquote>` — quoted source material is stripped before scanning.
+
+---
+
+## 2. High-level architecture
+
+Single-file plugin (`editorial-qa.php`) implemented as a static class `OGM_Editorial_QA`, plus an admin-only `OGM_EQA_List_Table` (extends `WP_List_Table`) and two admin assets.
+
+```
+schedule / re-save post ──► transition_post_status hook
+                                    │
+                                    ▼
+                            queue_scan(post_id, user_id, force)
+                                    │
+              ┌─────────────────────┴─────────────────────┐
+       Action Scheduler                              WP-Cron fallback
+   (as_enqueue_async_action,                   (wp_schedule_single_event,
+    group "ogm_editorial_qa")                        +10s)
+              └─────────────────────┬─────────────────────┘
+                                    ▼
+                            scan_post_job(post_id, user_id, force)
+                                    │
+            prepare_text_for_scan ──► sha256 hash ──► (skip if unchanged & !force)
+                                    │
+                            call_openai_for_typos ──► OpenAI Responses API
+                                    │
+                       validated issues[] ──► numbered text report
+                                    │
+                            persist to post meta
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+        Admin page              Meta box            Posts list column
+   (OGM_EQA_List_Table)   (editor sidebar)        (sortable "QA")
+```
+
+Manual **Rescan** (any UI surface) calls `wp_ajax_ogm_eqa_rescan`, which queues a scan with `force = true`.
+
+---
+
+## 3. Triggers
+
+Registered on `transition_post_status` (`on_transition_post_status`):
+
+1. **On schedule** — `old_status !== 'future' && new_status === 'future'`. Gated by the `scan_on_schedule` setting.
+2. **On update-while-scheduled** — `old_status === 'future' && new_status === 'future'`. Gated by both `scan_on_schedule` and `scan_on_update_while_scheduled`.
+3. **Manual** — the Rescan button (AJAX), always forced, works on any post status.
+
+A post must belong to an enabled post type (`post_types` setting) to trigger. A post that goes draft → publish without passing through `future` is **not** auto-scanned by design; Rescan covers it.
+
+---
+
+## 4. Processing pipeline
+
+### 4.1 Text preparation (`prepare_text_for_scan`)
+
+1. `strip_shortcodes()` on the body.
+2. Remove all `<blockquote>…</blockquote>` content (regex, dot-all, case-insensitive).
+3. Optionally `wp_strip_all_tags()` (the `strip_html` setting; on by default).
+4. `html_entity_decode()` (ENT_QUOTES | ENT_HTML5) on title and body.
+5. Unicode NFC normalization (`normalizer_normalize`) when `intl` is available.
+6. Strip zero-width / invisible characters (`U+200B–200D`, `U+FEFF`).
+7. Collapse runs of spaces/tabs; collapse 3+ newlines to 2; trim.
+8. Emit a single payload string: `"TITLE:\n{title}\n\nBODY:\n{body}\n"`.
+
+### 4.2 Content-hash deduplication
+
+`hash('sha256', $prepared)` is compared (via `hash_equals`) against the stored `_ogm_eqa_scanned_hash`. If equal and the scan is not forced, the job returns without calling OpenAI. On success the new hash is stored. **Effect:** re-saving unchanged content costs nothing.
+
+### 4.3 OpenAI request (`call_openai_for_typos`)
+
+- **Endpoint:** `POST https://api.openai.com/v1/responses`
+- **Auth:** `Authorization: Bearer <api_key>`
+- **Timeout:** 45s, via `wp_remote_post`.
+- **Body:**
+  - `model` — from settings (default `gpt-4o-mini`; empty falls back to `gpt-4o-mini`).
+  - `instructions` — the short system prompt enumerating in-scope/out-of-scope rules.
+  - `input` — the prepared TITLE/BODY payload.
+  - `max_output_tokens` — `max(300, min(2000, setting))`.
+  - `text.format` — strict JSON-schema structured output:
+
+```jsonc
+{
+  "type": "json_schema",
+  "name": "typo_report",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["issues"],
+    "properties": {
+      "issues": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["location", "type", "quote", "bad", "good"],
+          "properties": {
+            "location": { "type": "string", "enum": ["TITLE", "BODY"] },
+            "type":     { "type": "string",
+                          "enum": ["spelling", "duplicate_word",
+                                   "broken_capitalization", "broken_punctuation"] },
+            "quote":    { "type": "string", "maxLength": 80 },
+            "bad":      { "type": "string", "maxLength": 80 },
+            "good":     { "type": "string", "maxLength": 80 }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 4.4 Response handling
+
+- Non-JSON body → `WP_Error`.
+- HTTP ≥ 300 → `WP_Error` carrying `error.message`.
+- The structured payload is extracted defensively via `extract_structured_payload_fallback`, which handles several Responses API shapes: `output_json.json`, `output_json.data`, `output_text` containing JSON, top-level `output_text`, and a message-walk fallback.
+- Missing/!array `issues` → `WP_Error` with a short snippet (full response is **not** stored, for privacy).
+
+### 4.5 Report construction
+
+The human-readable report is built **server-side from validated issues only** (the model cannot inject commentary). For each issue with non-empty, differing `bad`/`good` and a valid `location`:
+
+```
+N. LOCATION: change 'bad' to 'good'
+```
+
+If no actionable issues remain, the report is the literal `"No obvious typos detected."`. Issue count is derived by `count_numbered_issues` (counts lines matching `^\d+[.)]\s`); a report containing "no obvious typos detected" forces count `0`.
+
+---
+
+## 5. Data model
+
+### 5.1 Post meta
+
+| Key | Meaning |
+|---|---|
+| `_ogm_eqa_report` | Numbered text report (or "No obvious typos detected.") |
+| `_ogm_eqa_issue_count` | Integer issue count (used for the badge & sorting) |
+| `_ogm_eqa_last_scanned_gmt` | Last scan time, `Y-m-d H:i:s` **GMT** |
+| `_ogm_eqa_scanned_hash` | SHA-256 of last-scanned prepared text |
+| `_ogm_eqa_model` | Model used for the last scan |
+| `_ogm_eqa_error` | Last error message (cleared at the start of each scan) |
+| `_ogm_eqa_last_trigger_user_id` | User who last triggered a scan |
+
+Timestamps are stored in GMT and **displayed** converted to the site's configured timezone (`get_date_from_gmt`).
+
+### 5.2 Settings (`ogm_eqa_settings` option, array)
+
+| Key | Default | Notes |
+|---|---|---|
+| `api_key` | `''` | Overridden by `OGM_EQA_OPENAI_API_KEY` constant at runtime |
+| `model` | `gpt-4o-mini` | Free-text |
+| `max_output_tokens` | `350` | Sanitized to 100–2000; clamped to 300–2000 at call time |
+| `post_types` | `['post']` | Which public post types are scanned/decorated |
+| `strip_html` | `1` | Strip HTML before scanning |
+| `scan_on_schedule` | `1` | Master switch for auto-scan |
+| `scan_on_update_while_scheduled` | `1` | Rescan on future → future |
+
+### 5.3 Constants
+
+- `OGM_EQA_VERSION` — `'1.2.0'`; used as the asset cache-buster.
+- `OGM_EQA_OPENAI_API_KEY` — optional, defined in `wp-config.php`; takes precedence over the stored key.
+
+### 5.4 Hooks / identifiers
+
+- Cron/job hook: `ogm_eqa_scan_post` → `scan_post_job($post_id, $user_id, $force)`.
+- Action Scheduler group: `ogm_editorial_qa`.
+- AJAX action: `ogm_eqa_rescan` (nonce action `ogm_eqa_rescan`).
+
+---
+
+## 6. Admin UI surfaces
+
+1. **Editorial QA page** (`admin.php?page=ogm-editorial-qa`, cap `edit_others_posts`) — `OGM_EQA_List_Table` with status views (Scheduled / Drafts / Pending / Published / All via `eqa_status`), search, 20/page pagination, columns Title / Status / Date / Issues / Last scan / Actions. Scheduled view sorts ascending by date; others descending.
+2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — API key, model, max tokens, post types, behavior toggles. Shows a notice when the key is being supplied by the wp-config constant.
+3. **Meta box** "Editorial QA (Typos)" — registered on each enabled post type, side/high. Shows Clean/Issues badge, last-scan time (site tz), error (if any), the numbered list, and a Rescan button.
+4. **Posts list "QA" column** — inserted after Title, sortable by `_ogm_eqa_issue_count`. Shows a numeric/`!`/`—` badge and an inline Rescan button.
+
+Assets (`ogm-eqa-admin.js`, `ogm-eqa-admin.css`) load only on the plugin pages, post-edit screens, and `edit.php` for enabled post types. The JS wires `.ogm-eqa-rescan` clicks to the AJAX endpoint and reports status inline.
+
+---
+
+## 7. Security model
+
+- **Capabilities:** viewing reports and rescanning require `edit_others_posts`; settings require `manage_options`.
+- **AJAX:** capability check + nonce (`check_ajax_referer`) before queuing.
+- **Output:** all dynamic output is escaped (`esc_html`/`esc_attr`/`esc_url`); the report is rebuilt from validated fields, never echoed raw from the model.
+- **Secrets:** the API key can be kept entirely out of the database via the wp-config constant. Full API responses are never persisted; only short snippets accompany error messages.
+
+---
+
+## 8. Cost & performance
+
+- One OpenAI request per scan; no scan when the content hash is unchanged and the scan is not forced.
+- Background execution (Action Scheduler preferred, WP-Cron fallback) keeps the editor responsive.
+- BYOK: all usage bills to the site owner's OpenAI account.
+
+---
+
+## 9. Known issues & roadmap
+
+Tracked items not addressed in 1.2.0:
+
+1. **No uninstall/data cleanup.** Post meta (`_ogm_eqa_*`) accumulates and is never removed; there is no `uninstall.php` or deactivation cleanup. *Roadmap: optional purge on uninstall.*
+2. **Unused `quote` field.** The schema requires `quote` (near-context) and the code captures it, but the report format omits it (the "near: …" output is commented out). *Roadmap: either surface it or drop it from the schema.*
+3. **`max_output_tokens` floor mismatch.** Settings allow 100 but the request clamps to a 300 minimum, so values 100–299 are silently raised. *Roadmap: align the two bounds.*
+4. **No retry/backoff** on transient OpenAI errors (rate limits, timeouts); the error is stored and the user must Rescan. *Roadmap: limited automatic retry.*
+5. **Direct publish is not auto-scanned** (draft → publish bypasses `future`). Intentional, but worth a settings hint or an opt-in "scan on publish".
+6. **`Tested up to`** header is a placeholder and should track the current WP release.
+
+---
+
+## 10. File inventory
+
+| File | Role |
+|---|---|
+| `editorial-qa.php` | All plugin logic (class, list table, hooks, OpenAI client) |
+| `ogm-eqa-admin.js` | Rescan button → AJAX wiring |
+| `ogm-eqa-admin.css` | Badge + meta-box list styling |
+| `README.md` | User/installer documentation (WordPress-readme style) |
+| `SPEC.md` | This document |
