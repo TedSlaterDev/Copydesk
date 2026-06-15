@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.4.0
+ * Version:           1.5.0
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.4.0');
+define('OGM_EQA_VERSION', '1.5.0');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -24,6 +24,13 @@ class OGM_Editorial_QA {
     const OPT_MODELS = 'ogm_eqa_models';
 
     const PROVIDERS = ['openai', 'anthropic'];
+
+    // Output-token bounds, aligned across the settings field and the API calls.
+    const MIN_TOKENS = 300;
+    const MAX_TOKENS = 2000;
+
+    // Provider HTTP statuses worth retrying with backoff.
+    const RETRY_STATUSES = [429, 500, 502, 503, 529];
 
     // Shown in each provider's model dropdown until "Refresh models" is clicked.
     // OpenAI: Responses API + strict structured outputs.
@@ -71,6 +78,7 @@ class OGM_Editorial_QA {
             'strip_html'        => 1,
             'scan_on_schedule'  => 1,
             'scan_on_update_while_scheduled' => 1,
+            'scan_on_publish'   => 0,
         ];
     }
 
@@ -128,18 +136,22 @@ class OGM_Editorial_QA {
 
         $s = self::settings();
 
-        if (empty($s['scan_on_schedule'])) return;
-
         $post_types = (array)($s['post_types'] ?? []);
         if (!in_array($post->post_type, $post_types, true)) return;
 
         // 1) When scheduling (anything -> future)
-        $is_schedule_event = ($new_status === 'future' && $old_status !== 'future');
+        $is_schedule_event = !empty($s['scan_on_schedule']) && ($new_status === 'future' && $old_status !== 'future');
 
         // 2) When updating a scheduled post (future -> future) (optional)
-        $is_update_while_scheduled = (!empty($s['scan_on_update_while_scheduled']) && $new_status === 'future' && $old_status === 'future');
+        $is_update_while_scheduled = !empty($s['scan_on_schedule']) && !empty($s['scan_on_update_while_scheduled'])
+            && $new_status === 'future' && $old_status === 'future';
 
-        if (!$is_schedule_event && !$is_update_while_scheduled) return;
+        // 3) On publish, e.g. a post published directly without scheduling (optional).
+        // future -> publish is included but harmless: the content hash dedups it
+        // against the scan already done at scheduling time.
+        $is_publish_event = !empty($s['scan_on_publish']) && $new_status === 'publish' && $old_status !== 'publish';
+
+        if (!$is_schedule_event && !$is_update_while_scheduled && !$is_publish_event) return;
 
         // Who initiated it?
         $user_id = get_current_user_id();
@@ -286,6 +298,38 @@ class OGM_Editorial_QA {
         return "TITLE:\n{$title}\n\nBODY:\n{$content}\n";
     }
 
+/**
+ * POST JSON with limited retry/backoff on transient provider errors
+ * (rate limits, 5xx, overloaded). Returns the wp_remote_post response or a
+ * WP_Error. Runs in a background job, so a short blocking backoff is fine.
+ */
+private static function request_json($endpoint, array $headers, array $body) {
+    $args = [
+        'timeout' => 45,
+        'headers' => $headers,
+        'body'    => wp_json_encode($body),
+    ];
+
+    $max  = 3;
+    $resp = null;
+    for ($attempt = 1; $attempt <= $max; $attempt++) {
+        $resp = wp_remote_post($endpoint, $args);
+
+        if (!is_wp_error($resp)) {
+            $code = (int) wp_remote_retrieve_response_code($resp);
+            if (!in_array($code, self::RETRY_STATUSES, true)) {
+                return $resp; // success or a non-retryable error — caller handles it
+            }
+        }
+
+        if ($attempt < $max) {
+            sleep($attempt); // 1s, then 2s
+        }
+    }
+
+    return $resp; // last attempt's response or WP_Error
+}
+
 /** Shared system prompt for both providers. Schema is the real enforcement. */
 private static function typo_instructions() {
     return <<<SYS
@@ -309,7 +353,7 @@ $body = [
     'model' => $model,
     'instructions' => $instructions,
     'input' => $text,
-    'max_output_tokens' => max(300, min(2000, (int)$max_output_tokens)),
+    'max_output_tokens' => max(self::MIN_TOKENS, min(self::MAX_TOKENS, (int)$max_output_tokens)),
 
     // Structured output (Responses API: text.format)
     'text' => [
@@ -346,10 +390,6 @@ $body = [
                                         'broken_punctuation',
                                     ],
                                 ],
-                                'quote' => [
-                                    'type' => 'string',
-                                    'maxLength' => 80,
-                                ],
                                 'bad' => [
                                     'type' => 'string',
                                     'maxLength' => 80,
@@ -359,7 +399,7 @@ $body = [
                                     'maxLength' => 80,
                                 ],
                             ],
-                            'required' => ['location', 'type', 'quote', 'bad', 'good'],
+                            'required' => ['location', 'type', 'bad', 'good'],
                         ],
                     ],
                 ],
@@ -369,16 +409,10 @@ $body = [
     ],
 ];
 
-    $args = [
-        'timeout' => 45,
-        'headers' => [
-            'Authorization' => 'Bearer ' . trim($api_key),
-            'Content-Type'  => 'application/json',
-        ],
-        'body' => wp_json_encode($body),
-    ];
-
-    $resp = wp_remote_post($endpoint, $args);
+    $resp = self::request_json($endpoint, [
+        'Authorization' => 'Bearer ' . trim($api_key),
+        'Content-Type'  => 'application/json',
+    ], $body);
     if (is_wp_error($resp)) return $resp;
 
     $code = (int) wp_remote_retrieve_response_code($resp);
@@ -451,7 +485,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
     $body = [
         'model'      => $model,
-        'max_tokens' => max(300, min(2000, (int)$max_output_tokens)),
+        'max_tokens' => max(self::MIN_TOKENS, min(self::MAX_TOKENS, (int)$max_output_tokens)),
         'system'     => self::typo_instructions(),
         'messages'   => [
             ['role' => 'user', 'content' => $text],
@@ -474,11 +508,10 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
                                         'type' => 'string',
                                         'enum' => ['spelling', 'duplicate_word', 'broken_capitalization', 'broken_punctuation'],
                                     ],
-                                    'quote' => ['type' => 'string'],
                                     'bad'   => ['type' => 'string'],
                                     'good'  => ['type' => 'string'],
                                 ],
-                                'required' => ['location', 'type', 'quote', 'bad', 'good'],
+                                'required' => ['location', 'type', 'bad', 'good'],
                             ],
                         ],
                     ],
@@ -488,15 +521,11 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         ],
     ];
 
-    $resp = wp_remote_post($endpoint, [
-        'timeout' => 45,
-        'headers' => [
-            'x-api-key'         => trim($api_key),
-            'anthropic-version' => '2023-06-01',
-            'content-type'      => 'application/json',
-        ],
-        'body' => wp_json_encode($body),
-    ]);
+    $resp = self::request_json($endpoint, [
+        'x-api-key'         => trim($api_key),
+        'anthropic-version' => '2023-06-01',
+        'content-type'      => 'application/json',
+    ], $body);
     if (is_wp_error($resp)) return $resp;
 
     $code = (int) wp_remote_retrieve_response_code($resp);
@@ -621,7 +650,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             $cap,
             'ogm-editorial-qa',
             [__CLASS__, 'render_admin_page'],
-            'dashicons-search',
+            'dashicons-editor-spellcheck',
             60
         );
 
@@ -658,11 +687,12 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $out['openai_model']    = isset($input['openai_model']) ? sanitize_text_field((string)$input['openai_model']) : $d['openai_model'];
         $out['anthropic_model'] = isset($input['anthropic_model']) ? sanitize_text_field((string)$input['anthropic_model']) : $d['anthropic_model'];
 
-        $out['max_output_tokens'] = isset($input['max_output_tokens']) ? max(100, min(2000, absint($input['max_output_tokens']))) : $d['max_output_tokens'];
+        $out['max_output_tokens'] = isset($input['max_output_tokens']) ? max(self::MIN_TOKENS, min(self::MAX_TOKENS, absint($input['max_output_tokens']))) : $d['max_output_tokens'];
 
         $out['strip_html'] = empty($input['strip_html']) ? 0 : 1;
         $out['scan_on_schedule'] = empty($input['scan_on_schedule']) ? 0 : 1;
         $out['scan_on_update_while_scheduled'] = empty($input['scan_on_update_while_scheduled']) ? 0 : 1;
+        $out['scan_on_publish'] = empty($input['scan_on_publish']) ? 0 : 1;
 
         $pts = isset($input['post_types']) ? (array)$input['post_types'] : $d['post_types'];
         $pts = array_values(array_filter(array_map('sanitize_key', $pts)));
@@ -704,7 +734,39 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             'nonce'    => wp_create_nonce('ogm_eqa_rescan'),
         ]);
 
-        wp_enqueue_style('ogm-eqa-admin-css', plugin_dir_url(__FILE__) . 'ogm-eqa-admin.css', [], OGM_EQA_VERSION);
+        wp_enqueue_style('ogm-eqa-admin-css', plugin_dir_url(__FILE__) . 'ogm-eqa-admin.css', ['dashicons'], OGM_EQA_VERSION);
+    }
+
+    /**
+     * Shared branded header + tab nav (Reports / Settings) for both screens.
+     */
+    private static function render_admin_header($current) {
+        $tabs = [
+            'ogm-editorial-qa'          => ['label' => 'Reports',  'icon' => 'editor-spellcheck'],
+            'ogm-editorial-qa-settings' => ['label' => 'Settings', 'icon' => 'admin-settings'],
+        ];
+
+        echo '<div class="ogm-eqa-header">';
+        echo '<div class="ogm-eqa-brand">';
+        echo '<span class="ogm-eqa-mark" aria-hidden="true"><span class="dashicons dashicons-editor-spellcheck"></span></span>';
+        echo '<div class="ogm-eqa-brand-text">';
+        echo '<h1>Editorial QA</h1>';
+        echo '<p class="ogm-eqa-tagline">AI typo checks for scheduled posts — by Orchard Grove Media</p>';
+        echo '</div>';
+        echo '</div>';
+        echo '<span class="ogm-eqa-version">v' . esc_html(OGM_EQA_VERSION) . '</span>';
+        echo '</div>';
+        echo '<hr class="wp-header-end" />';
+
+        echo '<nav class="ogm-eqa-tabs" aria-label="Editorial QA">';
+        foreach ($tabs as $slug => $t) {
+            $url    = add_query_arg(['page' => $slug], admin_url('admin.php'));
+            $active = ($slug === $current);
+            echo '<a href="' . esc_url($url) . '" class="ogm-eqa-tab ' . ($active ? 'is-active' : '') . '"' . ($active ? ' aria-current="page"' : '') . '>';
+            echo '<span class="dashicons dashicons-' . esc_attr($t['icon']) . '" aria-hidden="true"></span> ' . esc_html($t['label']);
+            echo '</a>';
+        }
+        echo '</nav>';
     }
 
     public static function render_admin_page() {
@@ -715,19 +777,22 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $table = new OGM_EQA_List_Table();
         $table->prepare_items();
 
-        echo '<div class="wrap">';
-        echo '<h1>Editorial QA</h1>';
-        echo '<p class="description">Scans posts for obvious typos when scheduled. Use “Rescan” after edits.</p>';
+        echo '<div class="wrap ogm-eqa-screen">';
+        self::render_admin_header('ogm-editorial-qa');
 
+        echo '<p class="ogm-eqa-intro">Posts are scanned for obvious typos when scheduled. Use <strong>Rescan</strong> after edits, or to check drafts and published posts on demand.</p>';
+
+        echo '<div class="ogm-eqa-card">';
         $table->views();
         echo '<form method="get">';
         if (!empty($_GET['eqa_status'])) {
-    echo '<input type="hidden" name="eqa_status" value="' . esc_attr(sanitize_key($_GET['eqa_status'])) . '" />';
-}
+            echo '<input type="hidden" name="eqa_status" value="' . esc_attr(sanitize_key($_GET['eqa_status'])) . '" />';
+        }
         echo '<input type="hidden" name="page" value="ogm-editorial-qa" />';
         $table->search_box('Search posts', 'ogm-eqa-search');
         $table->display();
         echo '</form>';
+        echo '</div>';
 
         echo '</div>';
     }
@@ -738,8 +803,8 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $s = self::settings();
         $all_post_types = get_post_types(['public' => true], 'objects');
 
-        echo '<div class="wrap">';
-        echo '<h1>Editorial QA Settings</h1>';
+        echo '<div class="wrap ogm-eqa-screen">';
+        self::render_admin_header('ogm-editorial-qa-settings');
 
         // Result notice from the "Refresh models" button (provider-aware).
         $models_notice   = isset($_GET['eqa_models']) ? sanitize_key(wp_unslash($_GET['eqa_models'])) : '';
@@ -755,6 +820,10 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
                 . esc_html(sprintf('Could not refresh %s models. Save the API key first, then check ', $prov_label))
                 . '<code>wp-content/debug.log</code> for the exact error.</p></div>';
         }
+
+        echo '<div class="ogm-eqa-layout">';
+        echo '<div class="ogm-eqa-main"><div class="ogm-eqa-card">';
+        echo '<p class="ogm-eqa-intro">Pick a provider, add your API key, and choose a model. Scans run automatically in the background when a post is scheduled.</p>';
 
         echo '<form method="post" action="options.php">';
         settings_fields(self::OPT_KEY);
@@ -785,7 +854,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<tr>';
         echo '<th scope="row"><label for="ogm-eqa-max-tokens">Max output tokens</label></th>';
         echo '<td>';
-        echo '<input id="ogm-eqa-max-tokens" name="' . esc_attr(self::OPT_KEY) . '[max_output_tokens]" type="number" min="100" max="2000" value="' . esc_attr((int)$s['max_output_tokens']) . '" />';
+        echo '<input id="ogm-eqa-max-tokens" name="' . esc_attr(self::OPT_KEY) . '[max_output_tokens]" type="number" min="' . esc_attr(self::MIN_TOKENS) . '" max="' . esc_attr(self::MAX_TOKENS) . '" value="' . esc_attr((int)$s['max_output_tokens']) . '" />';
         echo '</td>';
         echo '</tr>';
 
@@ -808,6 +877,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[strip_html]" value="1" ' . checked(1, (int)$s['strip_html'], false) . ' /> Strip HTML before scanning</label>';
         echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[scan_on_schedule]" value="1" ' . checked(1, (int)$s['scan_on_schedule'], false) . ' /> Scan when a post is scheduled</label>';
         echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[scan_on_update_while_scheduled]" value="1" ' . checked(1, (int)$s['scan_on_update_while_scheduled'], false) . ' /> Rescan when a scheduled post is updated (future → future)</label>';
+        echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[scan_on_publish]" value="1" ' . checked(1, (int)$s['scan_on_publish'], false) . ' /> Also scan on publish (catches posts published directly, without scheduling)</label>';
         echo '</td>';
         echo '</tr>';
 
@@ -815,6 +885,42 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
         submit_button('Save Settings');
         echo '</form>';
+        echo '</div></div>'; // .ogm-eqa-card, .ogm-eqa-main
+
+        echo '<aside class="ogm-eqa-sidebar">';
+        self::render_settings_sidebar($s);
+        echo '</aside>';
+
+        echo '</div>'; // .ogm-eqa-layout
+        echo '</div>'; // .wrap
+    }
+
+    /** Sidebar for the settings screen: at-a-glance status + helpful links. */
+    private static function render_settings_sidebar($s) {
+        $provider = self::active_provider($s);
+        $label    = $provider === 'anthropic' ? 'Anthropic (Claude)' : 'OpenAI';
+        $model    = $provider === 'anthropic' ? (string)($s['anthropic_model'] ?? '') : (string)($s['openai_model'] ?? '');
+        $key_set  = ($provider === 'anthropic')
+            ? trim((string)($s['anthropic_api_key'] ?? '')) !== ''
+            : trim((string)($s['openai_api_key'] ?? '')) !== '';
+
+        echo '<div class="ogm-eqa-card ogm-eqa-aside-card">';
+        echo '<h2>At a glance</h2>';
+        echo '<ul class="ogm-eqa-glance">';
+        echo '<li><span class="label">Provider</span><span class="value">' . esc_html($label) . '</span></li>';
+        echo '<li><span class="label">Model</span><span class="value"><code>' . esc_html($model ?: '—') . '</code></span></li>';
+        echo '<li><span class="ogm-eqa-dot ' . ($key_set ? 'is-on' : '') . '"></span><span class="label">API key</span><span class="value">' . ($key_set ? 'Configured' : 'Not set') . '</span></li>';
+        echo '<li><span class="ogm-eqa-dot ' . (!empty($s['scan_on_schedule']) ? 'is-on' : '') . '"></span><span class="label">Auto-scan</span><span class="value">' . (!empty($s['scan_on_schedule']) ? 'On' : 'Off') . '</span></li>';
+        echo '</ul>';
+        echo '</div>';
+
+        echo '<div class="ogm-eqa-card ogm-eqa-aside-card">';
+        echo '<h2>Get an API key</h2>';
+        echo '<ul class="ogm-eqa-links">';
+        echo '<li><a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener"><span class="dashicons dashicons-admin-network" aria-hidden="true"></span> OpenAI API keys</a></li>';
+        echo '<li><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener"><span class="dashicons dashicons-admin-network" aria-hidden="true"></span> Anthropic API keys</a></li>';
+        echo '</ul>';
+        echo '<p class="ogm-eqa-aside-foot">Tip: keep keys out of the database by defining <code>OGM_EQA_OPENAI_API_KEY</code> or <code>OGM_EQA_ANTHROPIC_API_KEY</code> in <code>wp-config.php</code>.</p>';
         echo '</div>';
     }
 
@@ -921,7 +1027,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
 if ($report && stripos($report, 'No obvious typos detected.') === false) {
 
-echo '<p style="line-height:1.3;">Note that sometimes AI gets it wrong, and one or more of the following may actually not be typos.</p>';
+echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or more of these may not actually be typos.</p>';
     $lines = preg_split('/\r\n|\r|\n/', $report);
 
     echo '<ol class="ogm-eqa-list">';

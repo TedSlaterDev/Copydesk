@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.4.0
+**Stable tag:** 1.5.0
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -68,7 +68,7 @@ For reliable background processing, install [Action Scheduler](https://actionsch
 
 ### When does a scan run automatically?
 
-When a post transitions into the **scheduled** (`future`) status, and — if enabled — each time an already-scheduled post is updated. A post published directly (draft → publish) without being scheduled is **not** scanned automatically; use the **Rescan** button for those.
+When a post transitions into the **scheduled** (`future`) status, and — if enabled — each time an already-scheduled post is updated. There's also an optional **Also scan on publish** setting that catches posts published directly (draft → publish) without being scheduled. With that off, use the **Rescan** button for directly-published posts.
 
 ### Does it change my content?
 
@@ -103,6 +103,13 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 
 ## Changelog
 
+### 1.5.0
+- **Refreshed admin design.** Both Editorial QA screens now share a branded header with Reports/Settings tabs, a card-based layout, a settings sidebar (at-a-glance status + key links), and the Orchard Grove Media visual style.
+- **New "Also scan on publish" option** — optionally scan posts that are published directly, without being scheduled first.
+- **Cleaner uninstall** — deleting the plugin now removes its options and post meta (`uninstall.php`).
+- **Automatic retry/backoff** on transient provider errors (rate limits, 5xx, overloaded) before surfacing an error.
+- Aligned the Max-output-tokens floor (300) between the settings field and the API calls, and dropped an unused schema field to trim each request slightly.
+
 ### 1.4.0
 - **Added Anthropic (Claude) support.** A new AI-provider selector lets you scan with either OpenAI or Anthropic. The Anthropic path uses the Messages API with structured outputs and defaults to `claude-haiku-4-5`.
 - Each provider has its own API-key field, model dropdown, **Refresh models** button, and optional wp-config constant (`OGM_EQA_OPENAI_API_KEY` / `OGM_EQA_ANTHROPIC_API_KEY`).
@@ -123,6 +130,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 - Structured-output typo scanning via the OpenAI Responses API; admin page, meta box, and Posts list column.
 
 ## Upgrade Notice
+
+### 1.5.0
+Refreshed admin UI, an optional "scan on publish" trigger, uninstall cleanup, and automatic retry on transient provider errors. No reconfiguration required.
 
 ### 1.4.0
 Adds Anthropic (Claude) as an alternative AI provider, selectable on the Settings page. Your existing OpenAI configuration is migrated automatically and remains the default.

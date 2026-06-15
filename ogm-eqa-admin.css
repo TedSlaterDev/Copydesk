@@ -1,21 +1,261 @@
-.ogm-eqa-badge{
-  display:inline-block;
-  min-width: 22px;
-  padding: 2px 8px;
-  border-radius: 2px;
-  font-weight: 600;
-  font-size: 12px;
-  line-height: 18px;
-  text-align:center;
-}
-.ogm-eqa-badge-good{ background:#e7f7ed; color:#146c2e; border:1px solid #b7e3c6; }
-.ogm-eqa-badge-bad{ background:#fde8e8; color:#b32d2e; border:1px solid #f5b5b5; }
+/* ==========================================================================
+   Editorial QA — admin styles (Orchard Grove Media design system)
+   ========================================================================== */
 
-/* Editorial QA meta box: numbered typo list */
+/* ---------- Badges (list table, Posts column, meta box) ---------- */
+.ogm-eqa-badge {
+	display: inline-block;
+	min-width: 22px;
+	padding: 2px 9px;
+	border-radius: 999px;
+	font-weight: 600;
+	font-size: 12px;
+	line-height: 18px;
+	text-align: center;
+}
+.ogm-eqa-badge-good { background: #e7f7ed; color: #146c2e; border: 1px solid #b7e3c6; }
+.ogm-eqa-badge-bad  { background: #fde8e8; color: #b32d2e; border: 1px solid #f5b5b5; }
+
+/* ---------- Branded screen header (Reports + Settings) ---------- */
+.ogm-eqa-screen { max-width: 1120px; }
+
+.ogm-eqa-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 1rem;
+	flex-wrap: wrap;
+	margin: 1rem 0 1rem;
+}
+.ogm-eqa-brand {
+	display: flex;
+	align-items: center;
+	gap: .85rem;
+}
+.ogm-eqa-mark {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 46px;
+	height: 46px;
+	border-radius: 12px;
+	background: #eef4e8;
+	border: 1px solid #d7e6cc;
+	color: #4b7a3f;
+}
+.ogm-eqa-mark .dashicons {
+	font-size: 26px;
+	width: 26px;
+	height: 26px;
+}
+.ogm-eqa-brand-text h1 {
+	margin: 0;
+	padding: 0;
+	font-size: 1.5rem;
+	line-height: 1.2;
+}
+.ogm-eqa-tagline {
+	margin: .15rem 0 0;
+	color: #646970;
+	font-size: .85rem;
+}
+.ogm-eqa-version {
+	font-weight: 600;
+	font-size: .8rem;
+	color: #4b7a3f;
+	background: #eef4e8;
+	border: 1px solid #d7e6cc;
+	border-radius: 999px;
+	padding: .2rem .7rem;
+}
+
+/* ---------- Tabs ---------- */
+.ogm-eqa-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .15rem;
+	margin: 0 0 1.1rem;
+	border-bottom: 1px solid #dcdcde;
+}
+.ogm-eqa-tab {
+	display: inline-flex;
+	align-items: center;
+	gap: .35rem;
+	padding: .6rem .9rem;
+	color: #50575e;
+	text-decoration: none;
+	font-weight: 500;
+	border-bottom: 2px solid transparent;
+	border-radius: 8px 8px 0 0;
+}
+.ogm-eqa-tab .dashicons {
+	font-size: 17px;
+	width: 17px;
+	height: 17px;
+}
+.ogm-eqa-tab:hover { color: #1d2327; background: #f6f7f7; }
+.ogm-eqa-tab.is-active {
+	color: #2c4f22;
+	background: #fff;
+	border-bottom-color: #5b8c3e;
+}
+.ogm-eqa-tab:focus {
+	outline: none;
+	box-shadow: 0 0 0 2px rgba(91, 140, 62, .35);
+}
+
+/* ---------- Layout + cards ---------- */
+.ogm-eqa-layout {
+	display: flex;
+	align-items: flex-start;
+	gap: 1.25rem;
+}
+.ogm-eqa-main { flex: 1 1 auto; min-width: 0; }
+.ogm-eqa-sidebar { flex: 0 0 280px; }
+.ogm-eqa-card {
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 12px;
+	padding: 1.25rem 1.5rem;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
+	margin: 0 0 1.25rem;
+}
+.ogm-eqa-intro {
+	margin: 0 0 .75rem;
+	color: #646970;
+	font-size: .92rem;
+}
+
+/* Form table inside the card */
+.ogm-eqa-card .form-table { margin-top: .25rem; }
+.ogm-eqa-card .form-table th {
+	width: 220px;
+	font-weight: 600;
+	padding: 1rem 1rem 1rem 0;
+}
+.ogm-eqa-card .form-table td { padding: .9rem 0; }
+.ogm-eqa-card .form-table tr { border-top: 1px solid #f0f0f1; }
+.ogm-eqa-card .form-table tr:first-child { border-top: none; }
+.ogm-eqa-card .form-table input[type="text"],
+.ogm-eqa-card .form-table input[type="password"],
+.ogm-eqa-card .form-table input[type="number"],
+.ogm-eqa-card .form-table select {
+	border-radius: 6px;
+}
+.ogm-eqa-card .form-table input:focus,
+.ogm-eqa-card .form-table select:focus {
+	border-color: #5b8c3e;
+	box-shadow: 0 0 0 1px #5b8c3e;
+}
+
+/* Brand-green primary button, scoped to our screens */
+.ogm-eqa-screen .button-primary {
+	background: #5b8c3e;
+	border-color: #4b7a3f;
+	box-shadow: none;
+	text-shadow: none;
+}
+.ogm-eqa-screen .button-primary:hover,
+.ogm-eqa-screen .button-primary:focus {
+	background: #4b7a3f;
+	border-color: #2c4f22;
+}
+.ogm-eqa-screen .button-primary:focus {
+	box-shadow: 0 0 0 1px #fff, 0 0 0 3px rgba(91, 140, 62, .5);
+}
+
+/* Provider "Refresh models" button sits next to the dropdown */
+.ogm-eqa-card .form-table select + .button { margin-left: .4rem; }
+
+/* ---------- Sidebar ---------- */
+.ogm-eqa-aside-card h2 {
+	margin: 0 0 .6rem;
+	font-size: 1rem;
+}
+.ogm-eqa-glance {
+	margin: 0;
+	list-style: none;
+	padding: 0;
+}
+.ogm-eqa-glance li {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	padding: .45rem 0;
+	border-top: 1px solid #f0f0f1;
+	font-size: .9rem;
+}
+.ogm-eqa-glance li:first-child { border-top: none; }
+.ogm-eqa-glance .label { color: #646970; }
+.ogm-eqa-glance .value { margin-left: auto; font-weight: 600; color: #1d2327; }
+.ogm-eqa-glance code {
+	background: #f6f7f7;
+	border: 1px solid #e2e2e4;
+	border-radius: 4px;
+	padding: 1px 6px;
+}
+.ogm-eqa-dot {
+	flex: 0 0 auto;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	background: #c3c4c7;
+}
+.ogm-eqa-dot.is-on { background: #5b8c3e; }
+
+.ogm-eqa-links {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.ogm-eqa-links li { margin: 0 0 .15rem; }
+.ogm-eqa-links a {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	padding: .4rem .5rem;
+	border-radius: 6px;
+	text-decoration: none;
+}
+.ogm-eqa-links a:hover { background: #f6f7f7; }
+.ogm-eqa-links .dashicons { color: #4b7a3f; }
+
+.ogm-eqa-aside-foot {
+	margin: 1rem 0 0;
+	color: #8c8f94;
+	font-size: .8rem;
+	line-height: 1.6;
+}
+
+@media screen and (max-width: 960px) {
+	.ogm-eqa-layout { flex-direction: column; }
+	.ogm-eqa-sidebar { flex-basis: auto; width: 100%; }
+}
+
+/* ---------- Meta box ---------- */
+.ogm-eqa-metabox .ogm-eqa-badge { font-size: 12px; }
+.ogm-eqa-metabox .description { color: #646970; }
+.ogm-eqa-metabox .ogm-eqa-disclaimer {
+	margin: .6rem 0;
+	padding: .5rem .65rem;
+	font-size: .85rem;
+	line-height: 1.4;
+	color: #5b4d10;
+	background: #fcf9e8;
+	border: 1px solid #f0e6a6;
+	border-left: 3px solid #dba617;
+	border-radius: 6px;
+}
 ol.ogm-eqa-list { margin-left: 1.3em; }
+ol.ogm-eqa-list li {
+	padding: .15rem 0;
+	line-height: 1.4;
+}
 ol.ogm-eqa-list li::marker {
-  font-weight: bold;
-  color: #b32d2e;
-  font-size: 1.1em;
+	font-weight: bold;
+	color: #b32d2e;
+	font-size: 1.1em;
 }
 ol.ogm-eqa-list span { color: #777; }
+.ogm-eqa-report { color: #146c2e; font-weight: 600; }
+.ogm-eqa-rescan-status { color: #646970; font-style: italic; }
