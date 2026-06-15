@@ -236,15 +236,24 @@
 .ogm-eqa-metabox .ogm-eqa-badge { font-size: 12px; }
 .ogm-eqa-metabox .description { color: #646970; }
 .ogm-eqa-metabox .ogm-eqa-disclaimer {
-	margin: .6rem 0;
+	display: flex;
+	align-items: flex-start;
+	gap: .45rem;
+	margin: .7rem 0;
 	padding: .5rem .65rem;
-	font-size: .85rem;
-	line-height: 1.4;
-	color: #5b4d10;
-	background: #fcf9e8;
-	border: 1px solid #f0e6a6;
-	border-left: 3px solid #dba617;
-	border-radius: 6px;
+	line-height: 1.45;
+	color: #4a5560;
+	background: #f0f6fc;
+	border: 1px solid #cfe2f3;
+	border-radius: 8px;
+}
+.ogm-eqa-metabox .ogm-eqa-disclaimer::before {
+	content: "\f348"; /* dashicons-info */
+	font-family: dashicons;
+	font-size: 16px;
+	line-height: 1.45;
+	color: #6f9bc7;
+	flex: 0 0 auto;
 }
 ol.ogm-eqa-list { margin-left: 1.3em; }
 ol.ogm-eqa-list li {

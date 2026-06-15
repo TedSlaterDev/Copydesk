@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.7.1
+ * Version:           1.7.2
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.7.1');
+define('OGM_EQA_VERSION', '1.7.2');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';

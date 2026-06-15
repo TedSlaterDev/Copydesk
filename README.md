@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.7.1
+**Stable tag:** 1.7.2
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -108,6 +108,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 3. The sortable "QA" column on the Posts list.
 
 ## Changelog
+
+### 1.7.2
+- Restyled the meta-box "AI isn't perfect" note as a calmer info note (info icon, lighter type) instead of the amber warning box.
 
 ### 1.7.1
 - **Fewer capitalization false positives.** The scanner no longer suggests lowercasing the first letter of a word, so correctly-capitalized proper nouns, acronyms, and headings (e.g. "White House", "WATCH:") are left alone — both via a stricter prompt and a server-side guard.
