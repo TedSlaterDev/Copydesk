@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.6.0
+**Stable tag:** 1.7.0
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -109,6 +109,11 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 
 ## Changelog
 
+### 1.7.0
+- **Refresh models now runs over AJAX** — the dropdown updates in place, errors show inline (never a blank page), and pressing Enter in a field saves settings instead of accidentally triggering a refresh.
+- Added a **"Create a key"** link beside each provider's API-key field (platform.openai.com / console.anthropic.com).
+- The Posts-list column is now labeled **Issues** (it shows each post's issue count and is toggleable from **Screen Options**).
+
 ### 1.6.0
 - **Configurable scan triggers.** Instead of only scanning scheduled posts, you can now pick any post status(es) that should trigger a scan — Draft, Pending review, Scheduled, Published, Private, or any custom editorial-workflow status registered on your site. Existing settings are migrated automatically (Scheduled stays on by default).
 - The **Refresh models** button now shows the exact reason on screen when it fails (missing key, HTTP 401, connectivity, …) instead of a generic/blank error.
@@ -141,6 +146,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 - Structured-output typo scanning via the OpenAI Responses API; admin page, meta box, and Posts list column.
 
 ## Upgrade Notice
+
+### 1.7.0
+Fixes the "Refresh models" button (now AJAX-based, with inline errors), adds per-provider key-creation links, and labels the Posts-list column "Issues". No settings migration required.
 
 ### 1.6.0
 Scan triggers are now per-status and configurable. Your previous schedule/publish settings are migrated automatically, so behavior is unchanged until you adjust them. Also fixes the "Refresh models" error to show a real message.

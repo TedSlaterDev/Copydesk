@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.6.0
+ * Version:           1.7.0
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.6.0');
+define('OGM_EQA_VERSION', '1.7.0');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -59,8 +59,8 @@ class OGM_Editorial_QA {
 
         add_action('wp_ajax_ogm_eqa_rescan', [__CLASS__, 'ajax_rescan']);
 
-        // "Refresh models" button on the Settings page.
-        add_action('admin_post_ogm_eqa_refresh_models', [__CLASS__, 'handle_refresh_models']);
+        // "Refresh models" button on the Settings page (AJAX — updates in place).
+        add_action('wp_ajax_ogm_eqa_refresh_models', [__CLASS__, 'ajax_refresh_models']);
 
         // Add QA column in normal Posts list table
         add_action('admin_init', [__CLASS__, 'register_list_table_column']);
@@ -746,8 +746,9 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         wp_enqueue_script('ogm-eqa-admin', plugin_dir_url(__FILE__) . 'ogm-eqa-admin.js', ['jquery'], OGM_EQA_VERSION, true);
 
         wp_localize_script('ogm-eqa-admin', 'OGM_EQA', [
-            'ajax_url' => admin_url('admin-ajax.php'),
-            'nonce'    => wp_create_nonce('ogm_eqa_rescan'),
+            'ajax_url'      => admin_url('admin-ajax.php'),
+            'nonce'         => wp_create_nonce('ogm_eqa_rescan'),
+            'refresh_nonce' => wp_create_nonce('ogm_eqa_refresh_models'),
         ]);
 
         wp_enqueue_style('ogm-eqa-admin-css', plugin_dir_url(__FILE__) . 'ogm-eqa-admin.css', ['dashicons'], OGM_EQA_VERSION);
@@ -822,35 +823,12 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<div class="wrap ogm-eqa-screen">';
         self::render_admin_header('ogm-editorial-qa-settings');
 
-        // Result notice from the "Refresh models" button (provider-aware).
-        $models_notice   = isset($_GET['eqa_models']) ? sanitize_key(wp_unslash($_GET['eqa_models'])) : '';
-        $models_provider = isset($_GET['eqa_models_provider']) ? sanitize_key(wp_unslash($_GET['eqa_models_provider'])) : '';
-        $models_count    = isset($_GET['eqa_models_count']) ? (int) $_GET['eqa_models_count'] : 0;
-        $prov_label      = $models_provider === 'anthropic' ? 'Anthropic' : 'OpenAI';
-        if ($models_notice === 'ok') {
-            echo '<div class="notice notice-success is-dismissible"><p>'
-                . esc_html(sprintf('%s models refreshed — %d available in the dropdown.', $prov_label, $models_count))
-                . '</p></div>';
-        } elseif ($models_notice === 'error') {
-            $detail = self::take_refresh_error();
-            echo '<div class="notice notice-error is-dismissible"><p>';
-            echo esc_html(sprintf('Could not refresh %s models.', $prov_label));
-            echo $detail !== ''
-                ? ' ' . esc_html($detail)
-                : esc_html(' Make sure the API key is saved, then try again.');
-            echo '</p></div>';
-        }
-
         echo '<div class="ogm-eqa-layout">';
         echo '<div class="ogm-eqa-main"><div class="ogm-eqa-card">';
         echo '<p class="ogm-eqa-intro">Pick a provider, add your API key, and choose a model. Scans run automatically in the background when a post enters one of the statuses you choose below.</p>';
 
         echo '<form method="post" action="options.php">';
         settings_fields(self::OPT_KEY);
-
-        // Nonce for the "Refresh models" buttons, which re-target this same
-        // form at admin-post.php via formaction.
-        wp_nonce_field('ogm_eqa_refresh_models', 'ogm_eqa_refresh_models_nonce');
 
         echo '<table class="form-table" role="presentation">';
 
@@ -969,6 +947,8 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $const     = $is_anthropic ? 'OGM_EQA_ANTHROPIC_API_KEY' : 'OGM_EQA_OPENAI_API_KEY';
         $const_set = defined($const) && constant($const);
         $eg        = $is_anthropic ? 'e.g. claude-haiku-4-5' : 'e.g. gpt-4o-mini';
+        $key_url   = $is_anthropic ? 'https://console.anthropic.com/settings/keys' : 'https://platform.openai.com/api-keys';
+        $key_host  = $is_anthropic ? 'console.anthropic.com' : 'platform.openai.com';
         $id_key    = 'ogm-eqa-' . $provider . '-key';
         $id_mdl    = 'ogm-eqa-' . $provider . '-model';
 
@@ -977,8 +957,9 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<th scope="row"><label for="' . esc_attr($id_key) . '">' . esc_html($label) . ' API key</label></th>';
         echo '<td>';
         echo '<input id="' . esc_attr($id_key) . '" name="' . esc_attr(self::OPT_KEY) . '[' . esc_attr($key_field) . ']" type="password" class="regular-text" value="' . esc_attr((string)($s[$key_field] ?? '')) . '" autocomplete="off" />';
+        echo '<p class="description"><a href="' . esc_url($key_url) . '" target="_blank" rel="noopener">Create a ' . esc_html($label) . ' key at ' . esc_html($key_host) . ' <span class="dashicons dashicons-external" style="font-size:14px;width:14px;height:14px;vertical-align:text-bottom;"></span></a></p>';
         if ($const_set) {
-            echo '<p class="description">Provided by <code>' . esc_html($const) . '</code> in wp-config.php — this field is ignored at runtime.</p>';
+            echo '<p class="description">Currently provided by <code>' . esc_html($const) . '</code> in wp-config.php — this field is ignored at runtime.</p>';
         } else {
             echo '<p class="description">Stored in wp_options unless you define <code>' . esc_html($const) . '</code> in wp-config.php.</p>';
         }
@@ -998,14 +979,16 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         }
         echo '</select> ';
 
-        $refresh_url = add_query_arg('action', 'ogm_eqa_refresh_models', admin_url('admin-post.php'));
-        echo '<button type="submit" class="button" name="provider" value="' . esc_attr($provider) . '" formaction="' . esc_url($refresh_url) . '" formnovalidate>Refresh ' . esc_html($label) . ' models</button>';
+        // AJAX refresh — type=button so it never submits the form (pressing
+        // Enter in a field saves settings instead of triggering a refresh).
+        echo '<button type="button" class="button ogm-eqa-refresh" data-provider="' . esc_attr($provider) . '" data-target="' . esc_attr($id_mdl) . '">Refresh ' . esc_html($label) . ' models</button> ';
+        echo '<span class="ogm-eqa-refresh-status" aria-live="polite"></span>';
 
         $updated = self::models_updated($provider);
         if ($updated) {
-            echo '<p class="description">Model list refreshed ' . esc_html(human_time_diff($updated, time())) . ' ago (' . esc_html($eg) . ').</p>';
+            echo '<p class="description ogm-eqa-refresh-meta">Model list refreshed ' . esc_html(human_time_diff($updated, time())) . ' ago (' . esc_html($eg) . ').</p>';
         } else {
-            echo '<p class="description">Showing a default list (' . esc_html($eg) . '). Save the ' . esc_html($label) . ' API key, then click <strong>Refresh ' . esc_html($label) . ' models</strong>.</p>';
+            echo '<p class="description ogm-eqa-refresh-meta">Showing a default list (' . esc_html($eg) . '). Save the ' . esc_html($label) . ' API key, then click <strong>Refresh ' . esc_html($label) . ' models</strong>.</p>';
         }
 
         echo '</td>';
@@ -1112,11 +1095,11 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
         foreach ($columns as $key => $label) {
             $new[$key] = $label;
             if ($key === 'title') {
-                $new['ogm_eqa'] = 'QA';
+                $new['ogm_eqa'] = 'Issues';
             }
         }
         if (!isset($new['ogm_eqa'])) {
-            $new['ogm_eqa'] = 'QA';
+            $new['ogm_eqa'] = 'Issues';
         }
         return $new;
     }
@@ -1234,43 +1217,23 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
     }
 
     /**
-     * admin-post handler for the "Refresh models" buttons. Calls the chosen
-     * provider's /v1/models endpoint, filters + ranks the results, and caches
-     * them per-provider so the dropdown can be populated from it.
+     * AJAX handler for the "Refresh models" buttons. Fetches the chosen
+     * provider's /v1/models, filters + ranks, caches per-provider, and returns
+     * the list as JSON so the dropdown updates in place (no page reload, and
+     * any error is shown inline rather than as a blank admin-post page).
      */
-    /** Stash a short, per-user reason for a failed model refresh (shown once). */
-    private static function set_refresh_error($message) {
-        $message = trim(wp_strip_all_tags((string)$message));
-        if ($message === '') return;
-        set_transient('ogm_eqa_refresh_error_' . get_current_user_id(), mb_substr($message, 0, 200), 2 * MINUTE_IN_SECONDS);
-    }
-
-    /** Read + clear the stashed refresh error for the current user. */
-    private static function take_refresh_error() {
-        $key = 'ogm_eqa_refresh_error_' . get_current_user_id();
-        $msg = get_transient($key);
-        if ($msg !== false) {
-            delete_transient($key);
-            return (string)$msg;
-        }
-        return '';
-    }
-
-    public static function handle_refresh_models() {
+    public static function ajax_refresh_models() {
         if (!current_user_can('manage_options')) {
-            wp_die('Sorry, you are not allowed to do that.', '', ['response' => 403]);
+            wp_send_json_error(['message' => 'Insufficient permissions.'], 403);
         }
-        check_admin_referer('ogm_eqa_refresh_models', 'ogm_eqa_refresh_models_nonce');
-
-        $redirect = admin_url('admin.php?page=ogm-editorial-qa-settings');
-        $s        = self::settings();
+        check_ajax_referer('ogm_eqa_refresh_models', 'nonce');
 
         $provider = isset($_POST['provider']) ? sanitize_key(wp_unslash($_POST['provider'])) : '';
         if (!in_array($provider, self::PROVIDERS, true)) {
-            self::set_refresh_error('Unknown provider in the refresh request.');
-            wp_safe_redirect(add_query_arg('eqa_models', 'error', $redirect));
-            exit;
+            wp_send_json_error(['message' => 'Unknown provider.'], 400);
         }
+
+        $s = self::settings();
 
         try {
             if ($provider === 'anthropic') {
@@ -1290,20 +1253,14 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
             update_option(self::OPT_MODELS, $all);
         } catch (\Throwable $e) {
             error_log("Editorial QA model refresh failed ($provider): " . $e->getMessage());
-            self::set_refresh_error($e->getMessage());
-            wp_safe_redirect(add_query_arg(
-                ['eqa_models' => 'error', 'eqa_models_provider' => $provider],
-                $redirect
-            ));
-            exit;
+            wp_send_json_error(['message' => mb_substr(trim(wp_strip_all_tags($e->getMessage())), 0, 200)]);
         }
 
-        wp_safe_redirect(add_query_arg([
-            'eqa_models'          => 'ok',
-            'eqa_models_provider' => $provider,
-            'eqa_models_count'    => count($models),
-        ], $redirect));
-        exit;
+        wp_send_json_success([
+            'models'  => array_values($models),
+            'count'   => count($models),
+            'message' => sprintf('Refreshed — %d models.', count($models)),
+        ]);
     }
 
     /**

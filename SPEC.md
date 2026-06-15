@@ -2,7 +2,7 @@
 
 **Plugin:** Editorial QA (AI Typos)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.6.0
+**Version of record:** 1.7.0
 **Requires:** WordPress 6.0+, PHP 8.0+
 **Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
@@ -237,8 +237,8 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 
 - Cron/job hook: `ogm_eqa_scan_post` → `scan_post_job($post_id, $user_id, $force)`.
 - Action Scheduler group: `ogm_editorial_qa`.
-- AJAX action: `ogm_eqa_rescan` (nonce action `ogm_eqa_rescan`).
-- admin-post action: `ogm_eqa_refresh_models` → `handle_refresh_models()` (nonce `ogm_eqa_refresh_models`, cap `manage_options`).
+- AJAX action: `ogm_eqa_rescan` (nonce `ogm_eqa_rescan`).
+- AJAX action: `ogm_eqa_refresh_models` → `ajax_refresh_models()` (nonce `ogm_eqa_refresh_models`, cap `manage_options`). Returns JSON; the dropdown updates client-side.
 
 ---
 
@@ -247,9 +247,9 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 Both admin screens share a branded header (`render_admin_header()`): an icon "mark", title + tagline, version pill, and a two-tab nav (**Reports** / **Settings**), styled with the Orchard Grove Media design system in `ogm-eqa-admin.css` (white rounded cards, green accent `#5b8c3e`, green focus rings). The CSS declares `dashicons` as a dependency.
 
 1. **Editorial QA page** (`admin.php?page=ogm-editorial-qa`, cap `edit_others_posts`) — branded header + an intro line + a card wrapping the `OGM_EQA_List_Table` (status views Scheduled / Drafts / Pending / Published / All via `eqa_status`, search, 20/page pagination, columns Title / Status / Date / Issues / Last scan / Actions). Scheduled view sorts ascending by date; others descending.
-2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — a card+sidebar layout. The **main card** holds the form: an **AI provider** selector, a per-provider section for **OpenAI** and for **Anthropic** (each via `render_provider_section()`: API key + model dropdown + **Refresh models** button), then max tokens, post types, a **Scan triggers** section (a checkbox per non-internal registered status from `get_post_stati`, plus the `rescan_on_update` toggle), and the Behavior toggle. The **sidebar** (`render_settings_sidebar()`) shows an at-a-glance card (active provider / model / key-configured dot / auto-scan = count of trigger statuses) and a links card. Both provider sections are always shown; the selector decides which is used at scan time. A per-section note appears when that provider's key is supplied by its wp-config constant. Each **Refresh models** button re-targets the settings form at `admin-post.php` (via `formaction`, carrying `name="provider"`) to call `handle_refresh_models()`, which fetches that provider's `/v1/models` (`fetch_openai_models` / `fetch_anthropic_models`), ranks/dedupes/caps the result (≤12), caches it under `ogm_eqa_models[<provider>]`, and redirects back with an `eqa_models=ok|error` + `eqa_models_provider` notice. **On failure the exact reason** (missing key, HTTP status, transport error) is stashed in a per-user transient (`set_refresh_error()` / `take_refresh_error()`) and shown inline in the error notice. The fetch uses the resolved key (settings or wp-config constant). Clicking Refresh does **not** save other settings changes — Save Settings is separate.
+2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — a card+sidebar layout. The **main card** holds the form: an **AI provider** selector, a per-provider section for **OpenAI** and for **Anthropic** (each via `render_provider_section()`: API key + model dropdown + **Refresh models** button), then max tokens, post types, a **Scan triggers** section (a checkbox per non-internal registered status from `get_post_stati`, plus the `rescan_on_update` toggle), and the Behavior toggle. The **sidebar** (`render_settings_sidebar()`) shows an at-a-glance card (active provider / model / key-configured dot / auto-scan = count of trigger statuses) and a links card. Both provider sections are always shown; the selector decides which is used at scan time. A per-section note appears when that provider's key is supplied by its wp-config constant. Each provider's API-key field carries a **"Create a key"** link to the provider's console (`platform.openai.com/api-keys` / `console.anthropic.com/settings/keys`). Each **Refresh models** button is a `type="button"` that fires an **AJAX** call (`ogm_eqa_refresh_models`) to `ajax_refresh_models()`, which fetches that provider's `/v1/models` (`fetch_openai_models` / `fetch_anthropic_models`), ranks/dedupes/caps the result (≤12), caches it under `ogm_eqa_models[<provider>]`, and returns JSON. The JS rebuilds the model `<select>` in place (preserving the current selection if still offered) and shows the result — or the **exact error** (missing key, HTTP status, transport) — inline next to the button; there is no page reload and no blank admin-post page. Because the button is not a submit control, pressing Enter in a field saves settings rather than triggering a refresh. The fetch uses the resolved key (settings or wp-config constant), so the key must be **saved** first.
 3. **Meta box** "Editorial QA (Typos)" — registered on each enabled post type, side/high. Shows Clean/Issues badge, last-scan time (site tz), error (if any), the numbered list, and a Rescan button.
-4. **Posts list "QA" column** — inserted after Title, sortable by `_ogm_eqa_issue_count`. Shows a numeric/`!`/`—` badge and an inline Rescan button.
+4. **Posts list "Issues" column** (on the native `edit.php`) — inserted after Title for each enabled post type, sortable by `_ogm_eqa_issue_count`. Shows a numeric/`!`/`—` badge and an inline Rescan button. Being a registered list-table column, WordPress automatically lists it in **Screen Options** so it can be shown/hidden per user.
 
 Assets (`ogm-eqa-admin.js`, `ogm-eqa-admin.css`) load only on the plugin pages, post-edit screens, and `edit.php` for enabled post types. The JS wires `.ogm-eqa-rescan` clicks to the AJAX endpoint and reports status inline.
 
