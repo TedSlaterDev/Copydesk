@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.7.2
+**Stable tag:** 1.10.0
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -109,6 +109,26 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 
 ## Changelog
 
+### 1.10.0
+- **Live Rescan** — clicking Rescan now shows a "Scanning…" state and updates the badge/report in place when the scan lands, no manual reload. This adds **no** usage cost: the scan is the same single API call, and the live update is the browser polling WordPress for the stored result (it never calls the AI provider).
+- **Costs tab** — a new Costs screen shows estimated AI spend (month-to-date, last-30-days, avg/scan), a daily-spend chart, and a per-model breakdown, computed from token usage recorded on each scan. Estimates use published list prices (filter `ogm_eqa_model_prices`) — close to, not identical to, your invoice.
+- **Monthly budget cap** (optional) — set a dollar cap in Settings → Advanced; scans pause for the rest of the UTC month once estimated spend reaches it.
+
+### 1.9.0
+Security & cost hardening:
+- **Per-post permission check** — Rescan now requires edit rights on that specific post, not just the broad capability.
+- **Less content leaves your site** — password-protected posts are never scanned; HTML comments (incl. block-editor markup) and URL/tracking attributes are stripped; and the body sent per scan is capped (filter `ogm_eqa_max_input_chars`, default 20,000).
+- **No raw responses stored** — parse-failure messages are now generic; verbose provider output is logged only when `WP_DEBUG` is on.
+- **Fewer duplicate jobs** — the Action Scheduler path skips an already-queued identical scan.
+
+### 1.8.1
+- **Security:** an API key supplied via a `wp-config.php` constant is no longer echoed into the settings field or written back into the database — the key field is shown empty and disabled when a constant provides it.
+- Fixed a no-JavaScript edge case: both providers' key/model fields now remain reachable when JavaScript is disabled.
+
+### 1.8.0
+- Settings are now grouped into panels — **AI provider**, **When to scan**, and **Advanced** — matching the other Orchard Grove Media plugins.
+- Only the **selected provider's** key and model fields are shown; the other provider's fields are hidden (but stay saved), and the view updates instantly when you switch the provider dropdown.
+
 ### 1.7.2
 - Restyled the meta-box "AI isn't perfect" note as a calmer info note (info icon, lighter type) instead of the amber warning box.
 
@@ -153,6 +173,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 - Structured-output typo scanning via the OpenAI Responses API; admin page, meta box, and Posts list column.
 
 ## Upgrade Notice
+
+### 1.10.0
+Adds Live Rescan (in-place results, no extra usage cost), a Costs tab, and an optional monthly budget cap. Creates one small database table (`{prefix}ogm_eqa_costs`) for the cost ledger; it's removed on uninstall.
 
 ### 1.7.1
 Reduces capitalization false positives (proper nouns, headings) and stops embedded scripts / lost line breaks from creating bogus "issues". No settings change required.

@@ -2,7 +2,7 @@
 
 **Plugin:** Editorial QA (AI Typos)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.7.1
+**Version of record:** 1.10.0
 **Requires:** WordPress 6.0+, PHP 8.0+
 **Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
@@ -86,15 +86,20 @@ A post must belong to an enabled post type (`post_types` setting) to trigger.
 ### 4.1 Text preparation (`prepare_text_for_scan`)
 
 1. `strip_shortcodes()` on the body.
-2. Remove all `<blockquote>…</blockquote>` content (regex, dot-all, case-insensitive).
-3. Remove `<script>`/`<style>` blocks **with their contents** — always, even when `strip_html` is off (embed code is never proofreadable text).
-4. Convert block-level boundaries (`<br>`, `</p>`, `</div>`, `</h1–6>`, `</li>`, …) to newlines, so separate paragraphs/headings stay on separate lines.
-5. Optionally `wp_strip_all_tags($content, false)` (the `strip_html` setting; on by default). The `false` **keeps line breaks** — collapsing them (the old `true`) glued e.g. a "WATCH:" heading to the next paragraph and produced false mid-sentence capitalization flags.
-6. `html_entity_decode()` (ENT_QUOTES | ENT_HTML5) on title and body.
-7. Unicode NFC normalization (`normalizer_normalize`) when `intl` is available.
-8. Strip zero-width / invisible characters (`U+200B–200D`, `U+FEFF`).
-9. Collapse runs of spaces/tabs; collapse 3+ newlines to 2; trim.
-10. Emit a single payload string: `"TITLE:\n{title}\n\nBODY:\n{body}\n"`.
+2. Remove HTML comments (`<!-- … -->`) — editor notes and block-editor delimiters (`<!-- wp:… -->`) are never proofreadable content.
+3. Remove URL/tracking attribute values (`href`, `src`, `srcset`, `data-*`) so they aren't transmitted even when `strip_html` is off.
+4. Remove all `<blockquote>…</blockquote>` content (regex, dot-all, case-insensitive).
+5. Remove `<script>`/`<style>` blocks **with their contents** — always, even when `strip_html` is off (embed code is never proofreadable text).
+6. Convert block-level boundaries (`<br>`, `</p>`, `</div>`, `</h1–6>`, `</li>`, …) to newlines, so separate paragraphs/headings stay on separate lines.
+7. Optionally `wp_strip_all_tags($content, false)` (the `strip_html` setting; on by default). The `false` **keeps line breaks** — collapsing them (the old `true`) glued e.g. a "WATCH:" heading to the next paragraph and produced false mid-sentence capitalization flags.
+8. `html_entity_decode()` (ENT_QUOTES | ENT_HTML5) on title and body.
+9. Unicode NFC normalization (`normalizer_normalize`) when `intl` is available.
+10. Strip zero-width / invisible characters (`U+200B–200D`, `U+FEFF`).
+11. Collapse runs of spaces/tabs; collapse 3+ newlines to 2; trim.
+12. **Cap the BODY** at `apply_filters('ogm_eqa_max_input_chars', 20000)` chars (0 disables); the title is never capped. Cost + privacy guard on very long posts.
+13. Emit a single payload string: `"TITLE:\n{title}\n\nBODY:\n{body}\n"`.
+
+Password-protected posts (`post_password` set) are **never scanned** — `scan_post_job` returns before preparing text.
 
 ### 4.2 Content-hash deduplication
 
@@ -217,6 +222,7 @@ Timestamps are stored in GMT and **displayed** converted to the site's configure
 | `strip_html` | `1` | Strip HTML before scanning |
 | `trigger_statuses` | `['future']` | Post-status slugs whose entry triggers a scan (sanitized against `get_post_stati(['internal'=>false])`) |
 | `rescan_on_update` | `1` | Also scan on re-save while already in a trigger status |
+| `monthly_budget_usd` | `0` | Optional cap on estimated spend per UTC month; `0` = no cap. When reached, `scan_post_job` stores a note and skips. |
 
 **Legacy migration:** installs from ≤ 1.3.0 stored a single `api_key` / `model`
 (OpenAI). `settings()` maps these to `openai_api_key` / `openai_model` on read,
@@ -243,6 +249,18 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 - Action Scheduler group: `ogm_editorial_qa`.
 - AJAX action: `ogm_eqa_rescan` (nonce `ogm_eqa_rescan`).
 - AJAX action: `ogm_eqa_refresh_models` → `ajax_refresh_models()` (nonce `ogm_eqa_refresh_models`, cap `manage_options`). Returns JSON; the dropdown updates client-side.
+- AJAX action: `ogm_eqa_scan_status` → `ajax_scan_status()` (nonce `ogm_eqa_scan_status`, cap `edit_others_posts` + per-post `edit_post`). Read-only poll for Live Rescan — returns the post's stored scan state as JSON; **no provider call**.
+- Cost ledger table: `{$wpdb->prefix}ogm_eqa_costs` (created via `dbDelta` in `maybe_upgrade()`, gated by option `ogm_eqa_db_version` = `DB_VERSION`; also on `register_activation_hook`). Columns: `id, created_gmt, provider, model, post_id, input_tokens, output_tokens, cost_micros` (`cost_micros` NULL when the model is unpriced).
+
+---
+
+## 5b. Cost tracking, Live Rescan & budget
+
+- **Usage capture.** `call_openai_for_typos` / `call_anthropic_for_typos` return `input_tokens` / `output_tokens` from each response's `usage`. On a successful scan, `scan_post_job` writes a ledger row (`record_cost`) and stores the per-post last cost in `_ogm_eqa_cost_micros`.
+- **Pricing.** `model_prices()` (filter `ogm_eqa_model_prices`) maps canonical model IDs → USD per 1M `['in','out']`. `price_for()` does a **longest-prefix** match (so dated IDs like `gpt-4o-mini-2024-…` / `claude-haiku-4-5-20251001` resolve). `cost_micros()` = `round(in·inPrice + out·outPrice)` in micro-USD, or **null** when unpriced (tokens still recorded; cost excluded). All costs are **estimates** from list prices.
+- **Costs screen** (`page=ogm-editorial-qa-costs`, cap `manage_options`, third header tab): stat cards (month-to-date / last-30-days / avg-per-scan / scans), a CSS daily-spend bar chart, a by-provider·model table, and a budget-progress bar when a cap is set — all aggregated from the ledger via `$wpdb` (table name interpolated from `$wpdb->prefix`; values via `prepare()`).
+- **Budget cap.** `monthly_budget_usd` > 0 → `scan_post_job` compares `month_spend_micros()` to the cap before calling the provider and, if reached, stores a note and returns.
+- **Live Rescan.** Clicking Rescan POSTs `ogm_eqa_rescan` (forces a scan, always updating `_ogm_eqa_last_scanned_gmt`), then the JS polls `ogm_eqa_scan_status` (~2.5s × ≤12) until `scanned_gmt` differs from the button's `data-scanned` baseline, then updates the badge (per `data-context`), status line, and — in the meta box — the report (`render_report_html()`) and cost, in place. Polling reads the DB only; **zero AI cost**. Password-protected posts clear their QA meta and are skipped.
 
 ---
 
@@ -251,7 +269,7 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 Both admin screens share a branded header (`render_admin_header()`): an icon "mark", title + tagline, version pill, and a two-tab nav (**Reports** / **Settings**), styled with the Orchard Grove Media design system in `ogm-eqa-admin.css` (white rounded cards, green accent `#5b8c3e`, green focus rings). The CSS declares `dashicons` as a dependency.
 
 1. **Editorial QA page** (`admin.php?page=ogm-editorial-qa`, cap `edit_others_posts`) — branded header + an intro line + a card wrapping the `OGM_EQA_List_Table` (status views Scheduled / Drafts / Pending / Published / All via `eqa_status`, search, 20/page pagination, columns Title / Status / Date / Issues / Last scan / Actions). Scheduled view sorts ascending by date; others descending.
-2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — a card+sidebar layout. The **main card** holds the form: an **AI provider** selector, a per-provider section for **OpenAI** and for **Anthropic** (each via `render_provider_section()`: API key + model dropdown + **Refresh models** button), then max tokens, post types, a **Scan triggers** section (a checkbox per non-internal registered status from `get_post_stati`, plus the `rescan_on_update` toggle), and the Behavior toggle. The **sidebar** (`render_settings_sidebar()`) shows an at-a-glance card (active provider / model / key-configured dot / auto-scan = count of trigger statuses) and a links card. Both provider sections are always shown; the selector decides which is used at scan time. A per-section note appears when that provider's key is supplied by its wp-config constant. Each provider's API-key field carries a **"Create a key"** link to the provider's console (`platform.openai.com/api-keys` / `console.anthropic.com/settings/keys`). Each **Refresh models** button is a `type="button"` that fires an **AJAX** call (`ogm_eqa_refresh_models`) to `ajax_refresh_models()`, which fetches that provider's `/v1/models` (`fetch_openai_models` / `fetch_anthropic_models`), ranks/dedupes/caps the result (≤12), caches it under `ogm_eqa_models[<provider>]`, and returns JSON. The JS rebuilds the model `<select>` in place (preserving the current selection if still offered) and shows the result — or the **exact error** (missing key, HTTP status, transport) — inline next to the button; there is no page reload and no blank admin-post page. Because the button is not a submit control, pressing Enter in a field saves settings rather than triggering a refresh. The fetch uses the resolved key (settings or wp-config constant), so the key must be **saved** first.
+2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — a main-column + sidebar layout. The **main column** holds the form, grouped into three **panels** (each a `.ogm-eqa-card` with an `.ogm-eqa-card-title`): **AI provider** (provider selector + per-provider `render_provider_section()` = API key + model dropdown + **Refresh models** button), **When to scan** (post types + the **Scan triggers** checkboxes, one per non-internal registered status from `get_post_stati`, + the `rescan_on_update` toggle), and **Advanced** (max output tokens + the strip-HTML Behavior toggle). The **sidebar** (`render_settings_sidebar()`) shows an at-a-glance card (active provider / model / key-configured dot / auto-scan = count of trigger statuses) and a links card. **Only the selected provider's key + model rows are shown** — `render_provider_section()` tags each provider's two rows with `class="ogm-eqa-provider-row" data-provider="…"` and hides the non-active provider's rows server-side (`display:none`, so it works without JS); a `change` handler on the provider dropdown (`eqaSyncProvider()`) toggles them live. Hidden rows still submit, so the other provider's saved key/model are preserved. A per-section note appears when that provider's key is supplied by its wp-config constant. Each provider's API-key field carries a **"Create a key"** link to the provider's console (`platform.openai.com/api-keys` / `console.anthropic.com/settings/keys`). Each **Refresh models** button is a `type="button"` that fires an **AJAX** call (`ogm_eqa_refresh_models`) to `ajax_refresh_models()`, which fetches that provider's `/v1/models` (`fetch_openai_models` / `fetch_anthropic_models`), ranks/dedupes/caps the result (≤12), caches it under `ogm_eqa_models[<provider>]`, and returns JSON. The JS rebuilds the model `<select>` in place (preserving the current selection if still offered) and shows the result — or the **exact error** (missing key, HTTP status, transport) — inline next to the button; there is no page reload and no blank admin-post page. Because the button is not a submit control, pressing Enter in a field saves settings rather than triggering a refresh. The fetch uses the resolved key (settings or wp-config constant), so the key must be **saved** first.
 3. **Meta box** "Editorial QA (Typos)" — registered on each enabled post type, side/high. Shows Clean/Issues badge, last-scan time (site tz), error (if any), the numbered list, and a Rescan button.
 4. **Posts list "Issues" column** (on the native `edit.php`) — inserted after Title for each enabled post type, sortable by `_ogm_eqa_issue_count`. Shows a numeric/`!`/`—` badge and an inline Rescan button. Being a registered list-table column, WordPress automatically lists it in **Screen Options** so it can be shown/hidden per user.
 
@@ -261,10 +279,11 @@ Assets (`ogm-eqa-admin.js`, `ogm-eqa-admin.css`) load only on the plugin pages, 
 
 ## 7. Security model
 
-- **Capabilities:** viewing reports and rescanning require `edit_others_posts`; settings require `manage_options`.
-- **AJAX:** capability check + nonce (`check_ajax_referer`) before queuing.
+- **Capabilities:** viewing reports requires `edit_others_posts`; settings require `manage_options`. `ajax_rescan` additionally enforces **`current_user_can('edit_post', $post_id)`** — a user can't push an arbitrary post to the provider on the strength of the broad cap alone.
+- **AJAX:** capability + per-post check + nonce (`check_ajax_referer`) before queuing.
 - **Output:** all dynamic output is escaped (`esc_html`/`esc_attr`/`esc_url`); the report is rebuilt from validated fields, never echoed raw from the model.
-- **Secrets:** the API key can be kept entirely out of the database via the wp-config constant. Full API responses are never persisted; only short snippets accompany error messages.
+- **What leaves the site:** password-protected posts are never scanned; HTML comments and `href`/`src`/`srcset`/`data-*` values are stripped; the body is capped (`ogm_eqa_max_input_chars`). Only the cleaned TITLE/BODY reaches the selected provider.
+- **Secrets:** each provider's key can be kept out of the DB via its wp-config constant — and when a constant is set the settings field renders empty + disabled and `sanitize_settings` refuses to persist it (preserving the stored value), so the secret can't leak into `wp_options`. Full API responses are **never** persisted; parse-failure messages are generic, with verbose detail logged only under `WP_DEBUG`.
 
 ---
 

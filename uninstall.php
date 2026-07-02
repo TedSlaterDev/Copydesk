@@ -10,9 +10,10 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
     exit;
 }
 
-// Settings + cached model lists.
+// Settings + cached model lists + DB version marker.
 delete_option('ogm_eqa_settings');
 delete_option('ogm_eqa_models');
+delete_option('ogm_eqa_db_version');
 
 // All post meta written by the scanner.
 $ogm_eqa_meta_keys = [
@@ -22,8 +23,14 @@ $ogm_eqa_meta_keys = [
     '_ogm_eqa_scanned_hash',
     '_ogm_eqa_model',
     '_ogm_eqa_error',
+    '_ogm_eqa_cost_micros',
     '_ogm_eqa_last_trigger_user_id',
 ];
 foreach ($ogm_eqa_meta_keys as $ogm_eqa_key) {
     delete_post_meta_by_key($ogm_eqa_key);
 }
+
+// Cost-ledger table.
+global $wpdb;
+$ogm_eqa_costs = $wpdb->prefix . 'ogm_eqa_costs';
+$wpdb->query("DROP TABLE IF EXISTS `{$ogm_eqa_costs}`");

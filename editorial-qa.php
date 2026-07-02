@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.7.2
+ * Version:           1.10.0
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.7.2');
+define('OGM_EQA_VERSION', '1.10.0');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -44,8 +44,11 @@ class OGM_Editorial_QA {
     const META_HASH            = '_ogm_eqa_scanned_hash';
     const META_MODEL           = '_ogm_eqa_model';
     const META_ERROR           = '_ogm_eqa_error';
+    const META_COST            = '_ogm_eqa_cost_micros'; // last scan cost, USD * 1e6 ('' if unpriced)
 
     const CRON_HOOK = 'ogm_eqa_scan_post';
+
+    const DB_VERSION = '1'; // bump to trigger the cost-ledger table (re)creation
 
     public static function init() {
         add_action('transition_post_status', [__CLASS__, 'on_transition_post_status'], 10, 3);
@@ -59,8 +62,14 @@ class OGM_Editorial_QA {
 
         add_action('wp_ajax_ogm_eqa_rescan', [__CLASS__, 'ajax_rescan']);
 
+        // Poll for a post's scan result (Live Rescan — no AI cost, reads the DB).
+        add_action('wp_ajax_ogm_eqa_scan_status', [__CLASS__, 'ajax_scan_status']);
+
         // "Refresh models" button on the Settings page (AJAX — updates in place).
         add_action('wp_ajax_ogm_eqa_refresh_models', [__CLASS__, 'ajax_refresh_models']);
+
+        // Create/upgrade the cost-ledger table when the DB version changes.
+        add_action('admin_init', [__CLASS__, 'maybe_upgrade']);
 
         // Add QA column in normal Posts list table
         add_action('admin_init', [__CLASS__, 'register_list_table_column']);
@@ -74,6 +83,7 @@ class OGM_Editorial_QA {
             'anthropic_api_key' => '',
             'anthropic_model'   => 'claude-haiku-4-5',
             'max_output_tokens' => 350,
+            'monthly_budget_usd'=> 0, // 0 = no cap
             'post_types'        => ['post'],
             'strip_html'        => 1,
             // Post statuses whose entry triggers a scan. Default: Scheduled.
@@ -180,11 +190,14 @@ class OGM_Editorial_QA {
 
         // Prefer Action Scheduler if available.
         if (function_exists('as_enqueue_async_action')) {
-            as_enqueue_async_action(self::CRON_HOOK, [
-                'post_id' => $post_id,
-                'user_id' => $user_id,
-                'force'   => $force ? 1 : 0,
-            ], 'ogm_editorial_qa');
+            $as_args = ['post_id' => $post_id, 'user_id' => $user_id, 'force' => $force ? 1 : 0];
+            // Skip if an identical scan is already queued (avoid piling up jobs
+            // on rapid re-saves). Mirrors the WP-Cron branch below.
+            if (function_exists('as_has_scheduled_action')
+                && as_has_scheduled_action(self::CRON_HOOK, $as_args, 'ogm_editorial_qa')) {
+                return;
+            }
+            as_enqueue_async_action(self::CRON_HOOK, $as_args, 'ogm_editorial_qa');
             return;
         }
 
@@ -218,6 +231,16 @@ class OGM_Editorial_QA {
         $post_types = (array)($s['post_types'] ?? []);
         if (!in_array($post->post_type, $post_types, true)) return;
 
+        // Never transmit password-gated content. Clear any stale QA meta so the
+        // badges/report don't keep describing content we can no longer verify
+        // (otherwise a prior scan's result/error would linger forever).
+        if ((string)$post->post_password !== '') {
+            foreach ([self::META_REPORT, self::META_ISSUE_COUNT, self::META_ERROR, self::META_HASH, self::META_LAST_SCANNED_GM, self::META_MODEL] as $mk) {
+                delete_post_meta($post_id, $mk);
+            }
+            return;
+        }
+
         $prepared = self::prepare_text_for_scan($post->post_title, $post->post_content, !empty($s['strip_html']));
         $hash = hash('sha256', $prepared);
 
@@ -229,6 +252,13 @@ class OGM_Editorial_QA {
         }
 
         delete_post_meta($post_id, self::META_ERROR);
+
+        // Optional monthly budget guardrail — stop before spending past the cap.
+        $budget = (float)($s['monthly_budget_usd'] ?? 0);
+        if ($budget > 0 && self::month_spend_micros() >= (int) round($budget * 1000000)) {
+            self::store_error($post_id, sprintf('Monthly scan budget of $%s reached — this scan was skipped. Raise it in Editorial QA → Settings.', number_format($budget, 2)));
+            return;
+        }
 
         $max_tokens = (int)$s['max_output_tokens'];
         $result = ($provider === 'anthropic')
@@ -257,6 +287,15 @@ class OGM_Editorial_QA {
         update_post_meta($post_id, self::META_HASH, $hash);
         update_post_meta($post_id, self::META_MODEL, $model);
 
+        // Record token usage + estimated cost in the ledger (for the Costs tab).
+        $in  = (int)($result['input_tokens'] ?? 0);
+        $out = (int)($result['output_tokens'] ?? 0);
+        if ($in > 0 || $out > 0) {
+            self::record_cost($provider, $model, $post_id, $in, $out);
+            $micros = self::cost_micros($model, $in, $out);
+            update_post_meta($post_id, self::META_COST, $micros === null ? '' : (int)$micros);
+        }
+
         if ($user_id) {
             update_post_meta($post_id, '_ogm_eqa_last_trigger_user_id', $user_id);
         }
@@ -267,6 +306,137 @@ class OGM_Editorial_QA {
         update_post_meta($post_id, self::META_LAST_SCANNED_GM, gmdate('Y-m-d H:i:s'));
     }
 
+    /** Log verbose diagnostics to the PHP error log only when WP_DEBUG is on. */
+    private static function debug_log($detail) {
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('Editorial QA: ' . (string)$detail);
+        }
+    }
+
+    /** --------- Cost ledger --------- */
+
+    /** Fully-qualified cost-ledger table name. */
+    public static function costs_table() {
+        global $wpdb;
+        return $wpdb->prefix . 'ogm_eqa_costs';
+    }
+
+    /** Create/upgrade the ledger table when DB_VERSION changes (cheap option check). */
+    public static function maybe_upgrade() {
+        if (get_option('ogm_eqa_db_version') === self::DB_VERSION) return;
+
+        global $wpdb;
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $table   = self::costs_table();
+        $charset = $wpdb->get_charset_collate();
+        // dbDelta is whitespace/format sensitive — keep two spaces after PRIMARY KEY.
+        $sql = "CREATE TABLE $table (
+  id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  created_gmt datetime NOT NULL,
+  provider varchar(20) NOT NULL DEFAULT '',
+  model varchar(100) NOT NULL DEFAULT '',
+  post_id bigint(20) unsigned NOT NULL DEFAULT 0,
+  input_tokens int unsigned NOT NULL DEFAULT 0,
+  output_tokens int unsigned NOT NULL DEFAULT 0,
+  cost_micros bigint(20) DEFAULT NULL,
+  PRIMARY KEY  (id),
+  KEY created_gmt (created_gmt),
+  KEY model (model),
+  KEY post_id (post_id)
+) $charset;";
+        dbDelta($sql);
+        update_option('ogm_eqa_db_version', self::DB_VERSION);
+    }
+
+    /**
+     * Estimated prices, USD per 1M tokens as ['in'=>, 'out'=>]. These are public
+     * list-price approximations; override precisely via the filter.
+     */
+    public static function model_prices() {
+        $prices = [
+            // OpenAI
+            'gpt-4o-mini'   => ['in' => 0.15, 'out' => 0.60],
+            'gpt-4o'        => ['in' => 2.50, 'out' => 10.00],
+            'gpt-4.1-nano'  => ['in' => 0.10, 'out' => 0.40],
+            'gpt-4.1-mini'  => ['in' => 0.40, 'out' => 1.60],
+            'gpt-4.1'       => ['in' => 2.00, 'out' => 8.00],
+            'o4-mini'       => ['in' => 1.10, 'out' => 4.40],
+            'o3-mini'       => ['in' => 1.10, 'out' => 4.40],
+            // Anthropic
+            'claude-3-5-haiku'  => ['in' => 0.80, 'out' => 4.00],
+            'claude-haiku-4-5'  => ['in' => 1.00, 'out' => 5.00],
+            'claude-sonnet-4-5' => ['in' => 3.00, 'out' => 15.00],
+            'claude-sonnet-4-6' => ['in' => 3.00, 'out' => 15.00],
+            'claude-opus-4-6'   => ['in' => 5.00, 'out' => 25.00],
+            'claude-opus-4-8'   => ['in' => 5.00, 'out' => 25.00],
+            'claude-fable-5'    => ['in' => 10.00, 'out' => 50.00],
+        ];
+        return apply_filters('ogm_eqa_model_prices', $prices);
+    }
+
+    /** Longest-prefix price lookup (handles dated model IDs). Null if unpriced. */
+    private static function price_for($model) {
+        $model = strtolower(trim((string)$model));
+        if ($model === '') return null;
+        $best = null; $best_len = -1;
+        foreach (self::model_prices() as $key => $p) {
+            $k = strtolower($key);
+            if (strpos($model, $k) === 0 && strlen($k) > $best_len && isset($p['in'], $p['out'])) {
+                $best = $p; $best_len = strlen($k);
+            }
+        }
+        return $best;
+    }
+
+    /**
+     * Conservative price used for models missing from the table, so the budget
+     * cap stays effective and the Costs total is never silently zero. Filterable.
+     */
+    public static function fallback_price() {
+        return apply_filters('ogm_eqa_fallback_price', ['in' => 5.00, 'out' => 25.00]);
+    }
+
+    /**
+     * Estimated cost in micro-USD (USD * 1e6). Always returns an int — unpriced
+     * models fall back to a conservative estimate so budget/totals still count.
+     */
+    private static function cost_micros($model, $in, $out) {
+        $p = self::price_for($model);
+        if ($p === null) $p = self::fallback_price();
+        // price is USD per 1M tokens → micros = tokens * price (units cancel to micro-USD).
+        return (int) round(((int)$in) * $p['in'] + ((int)$out) * $p['out']);
+    }
+
+    /** Append a ledger row for one scan. cost_micros is NULL when unpriced. */
+    private static function record_cost($provider, $model, $post_id, $in, $out) {
+        global $wpdb;
+        $wpdb->insert(
+            self::costs_table(),
+            [
+                'created_gmt'   => gmdate('Y-m-d H:i:s'),
+                'provider'      => substr((string)$provider, 0, 20),
+                'model'         => substr((string)$model, 0, 100),
+                'post_id'       => (int)$post_id,
+                'input_tokens'  => max(0, (int)$in),
+                'output_tokens' => max(0, (int)$out),
+                'cost_micros'   => self::cost_micros($model, $in, $out), // int or null
+            ],
+            ['%s', '%s', '%s', '%d', '%d', '%d', '%d']
+        );
+    }
+
+    /** Sum of estimated cost (micro-USD) since the start of the current UTC month. */
+    private static function month_spend_micros() {
+        global $wpdb;
+        $start = gmdate('Y-m-01 00:00:00');
+        $table = self::costs_table();
+        $sum = $wpdb->get_var($wpdb->prepare(
+            "SELECT COALESCE(SUM(cost_micros),0) FROM $table WHERE created_gmt >= %s",
+            $start
+        ));
+        return (int)$sum;
+    }
+
     /** --------- Text prep + AI call --------- */
 
     private static function prepare_text_for_scan($title, $content, $strip_html = true) {
@@ -274,6 +444,17 @@ class OGM_Editorial_QA {
         $content = (string)$content;
 
         $content = strip_shortcodes($content);
+
+		// Strip HTML comments — editor notes and Gutenberg block delimiters
+		// (<!-- wp:… -->) are never proofreadable content.
+		$content = preg_replace('#<!--.*?-->#s', '', $content);
+
+		// Drop URL / tracking attribute values (href, src, srcset, data-*) from
+		// tags so they aren't transmitted even when "Strip HTML" is off. Scoped
+		// to tag interiors via a callback so prose like "set src = 42" is safe.
+		$content = preg_replace_callback('#<[a-z][^>]*>#i', function ($m) {
+			return preg_replace('#\s(?:href|src|srcset|data-[a-z0-9_-]+)\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)#i', '', $m[0]);
+		}, $content);
 
 		// Remove ALL blockquote content (leave other HTML intact for later stripping/decoding)
 		$content = preg_replace(
@@ -316,6 +497,13 @@ class OGM_Editorial_QA {
 		$content = preg_replace("/[ \t]+/u", " ", $content);
 		$content = preg_replace("/\n{3,}/u", "\n\n", $content);
 		$content = trim($content);
+
+		// Cap body length sent to the provider (cost + privacy guard). Filterable;
+		// set to 0 to disable. Applies to the BODY only — the title is always kept.
+		$max_chars = (int) apply_filters('ogm_eqa_max_input_chars', 20000);
+		if ($max_chars > 0 && mb_strlen($content) > $max_chars) {
+			$content = rtrim(mb_substr($content, 0, $max_chars));
+		}
 
 		$title = preg_replace("/[ \t]+/u", " ", $title);
 		$title = trim($title);
@@ -457,17 +645,22 @@ $body = [
     $payload = self::extract_structured_payload_fallback($json);
 
     if (!is_array($payload)) {
-        // Keep this short; avoid storing the full response for privacy.
-        $snippet = mb_substr($raw, 0, 400);
-        return new WP_Error('ogm_eqa_empty', 'Model response could not be parsed as structured JSON. Snippet: ' . $snippet);
+        // Never store raw response bodies (privacy); log for debugging only.
+        self::debug_log('OpenAI response not parseable as structured JSON. Snippet: ' . mb_substr($raw, 0, 400));
+        return new WP_Error('ogm_eqa_empty', 'The model response could not be parsed as structured JSON.');
     }
 
     if (!isset($payload['issues']) || !is_array($payload['issues'])) {
-        $snippet = mb_substr(wp_json_encode($payload), 0, 300);
-        return new WP_Error('ogm_eqa_bad_structured', 'Structured payload missing issues[]. Payload snippet: ' . $snippet);
+        self::debug_log('OpenAI structured payload missing issues[]: ' . mb_substr(wp_json_encode($payload), 0, 300));
+        return new WP_Error('ogm_eqa_bad_structured', 'The model returned an unexpected response shape.');
     }
 
-    return ['report' => self::build_report_from_issues($payload['issues'])];
+    $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
+    return [
+        'report'        => self::build_report_from_issues($payload['issues']),
+        'input_tokens'  => (int)($usage['input_tokens'] ?? 0),
+        'output_tokens' => (int)($usage['output_tokens'] ?? 0),
+    ];
 }
 
 /**
@@ -616,11 +809,16 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
     $payload = json_decode(trim($out_text), true);
     if (!is_array($payload) || !isset($payload['issues']) || !is_array($payload['issues'])) {
-        $snippet = mb_substr($raw, 0, 400);
-        return new WP_Error('ogm_eqa_bad_structured', 'Anthropic response could not be parsed as structured JSON. Snippet: ' . $snippet);
+        self::debug_log('Anthropic response not parseable as structured JSON. Snippet: ' . mb_substr($raw, 0, 400));
+        return new WP_Error('ogm_eqa_bad_structured', 'The response could not be parsed as structured JSON.');
     }
 
-    return ['report' => self::build_report_from_issues($payload['issues'])];
+    $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
+    return [
+        'report'        => self::build_report_from_issues($payload['issues']),
+        'input_tokens'  => (int)($usage['input_tokens'] ?? 0),
+        'output_tokens' => (int)($usage['output_tokens'] ?? 0),
+    ];
 }
 
     private static function extract_output_text_fallback(array $json) {
@@ -714,6 +912,15 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
         add_submenu_page(
             'ogm-editorial-qa',
+            'Costs',
+            'Costs',
+            'manage_options',
+            'ogm-editorial-qa-costs',
+            [__CLASS__, 'render_costs_page']
+        );
+
+        add_submenu_page(
+            'ogm-editorial-qa',
             'Settings',
             'Settings',
             'manage_options',
@@ -737,15 +944,26 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $prov = isset($input['provider']) ? sanitize_key((string)$input['provider']) : $d['provider'];
         $out['provider'] = in_array($prov, self::PROVIDERS, true) ? $prov : $d['provider'];
 
-        // API keys are ignored at runtime if the matching wp-config constant is
-        // defined, but we still store whatever was entered.
-        $out['openai_api_key']    = isset($input['openai_api_key']) ? trim((string)$input['openai_api_key']) : '';
-        $out['anthropic_api_key'] = isset($input['anthropic_api_key']) ? trim((string)$input['anthropic_api_key']) : '';
+        // When a provider's key is supplied by a wp-config constant, never write
+        // it (or anything) to the DB — preserve the existing stored value so the
+        // constant's secret can't leak into wp_options. Otherwise store what was
+        // entered.
+        $stored = get_option(self::OPT_KEY, []);
+        if (!is_array($stored)) $stored = [];
+
+        $out['openai_api_key'] = (defined('OGM_EQA_OPENAI_API_KEY') && OGM_EQA_OPENAI_API_KEY)
+            ? (string)($stored['openai_api_key'] ?? '')
+            : (isset($input['openai_api_key']) ? trim((string)$input['openai_api_key']) : '');
+        $out['anthropic_api_key'] = (defined('OGM_EQA_ANTHROPIC_API_KEY') && OGM_EQA_ANTHROPIC_API_KEY)
+            ? (string)($stored['anthropic_api_key'] ?? '')
+            : (isset($input['anthropic_api_key']) ? trim((string)$input['anthropic_api_key']) : '');
 
         $out['openai_model']    = isset($input['openai_model']) ? sanitize_text_field((string)$input['openai_model']) : $d['openai_model'];
         $out['anthropic_model'] = isset($input['anthropic_model']) ? sanitize_text_field((string)$input['anthropic_model']) : $d['anthropic_model'];
 
         $out['max_output_tokens'] = isset($input['max_output_tokens']) ? max(self::MIN_TOKENS, min(self::MAX_TOKENS, absint($input['max_output_tokens']))) : $d['max_output_tokens'];
+
+        $out['monthly_budget_usd'] = isset($input['monthly_budget_usd']) ? max(0, (float)$input['monthly_budget_usd']) : $d['monthly_budget_usd'];
 
         $out['strip_html'] = empty($input['strip_html']) ? 0 : 1;
         $out['rescan_on_update'] = empty($input['rescan_on_update']) ? 0 : 1;
@@ -794,6 +1012,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         wp_localize_script('ogm-eqa-admin', 'OGM_EQA', [
             'ajax_url'      => admin_url('admin-ajax.php'),
             'nonce'         => wp_create_nonce('ogm_eqa_rescan'),
+            'status_nonce'  => wp_create_nonce('ogm_eqa_scan_status'),
             'refresh_nonce' => wp_create_nonce('ogm_eqa_refresh_models'),
         ]);
 
@@ -806,6 +1025,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
     private static function render_admin_header($current) {
         $tabs = [
             'ogm-editorial-qa'          => ['label' => 'Reports',  'icon' => 'editor-spellcheck'],
+            'ogm-editorial-qa-costs'    => ['label' => 'Costs',    'icon' => 'chart-bar'],
             'ogm-editorial-qa-settings' => ['label' => 'Settings', 'icon' => 'admin-settings'],
         ];
 
@@ -860,6 +1080,117 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '</div>';
     }
 
+    public static function render_costs_page() {
+        if (!current_user_can('manage_options')) wp_die('Insufficient permissions.');
+
+        global $wpdb;
+        self::maybe_upgrade(); // ensure the table exists before querying
+        $table = self::costs_table();
+
+        $month_start = gmdate('Y-m-01 00:00:00');
+        $d30_start   = gmdate('Y-m-d 00:00:00', time() - 29 * DAY_IN_SECONDS);
+
+        // $table comes from $wpdb->prefix (safe); values use prepare().
+        $month_micros = (int) $wpdb->get_var($wpdb->prepare("SELECT COALESCE(SUM(cost_micros),0) FROM $table WHERE created_gmt >= %s", $month_start));
+        $d30_micros   = (int) $wpdb->get_var($wpdb->prepare("SELECT COALESCE(SUM(cost_micros),0) FROM $table WHERE created_gmt >= %s", $d30_start));
+        $d30_scans    = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $table WHERE created_gmt >= %s", $d30_start));
+
+        $rows_daily = $wpdb->get_results($wpdb->prepare(
+            "SELECT DATE(created_gmt) AS d, COALESCE(SUM(cost_micros),0) AS micros FROM $table WHERE created_gmt >= %s GROUP BY DATE(created_gmt)",
+            $d30_start
+        ), ARRAY_A);
+        $by_day = [];
+        foreach ((array)$rows_daily as $r) { $by_day[$r['d']] = (int)$r['micros']; }
+
+        $rows_model = $wpdb->get_results($wpdb->prepare(
+            "SELECT provider, model, COUNT(*) AS scans, COALESCE(SUM(input_tokens),0) AS in_t, COALESCE(SUM(output_tokens),0) AS out_t, COALESCE(SUM(cost_micros),0) AS micros
+             FROM $table WHERE created_gmt >= %s GROUP BY provider, model ORDER BY micros DESC",
+            $month_start
+        ), ARRAY_A);
+
+        $usd = function ($m) {
+            $v = $m / 1000000;
+            if ($v == 0)      return '$0.00';
+            if ($v >= 0.10)   return '$' . number_format($v, 2);
+            if ($v >= 0.001)  return '$' . number_format($v, 4);
+            return '$' . number_format($v, 6);
+        };
+        $avg = $d30_scans ? (int) round($d30_micros / $d30_scans) : 0;
+
+        echo '<div class="wrap ogm-eqa-screen">';
+        self::render_admin_header('ogm-editorial-qa-costs');
+        echo '<p class="ogm-eqa-intro">Estimated AI spend from token usage &times; published list prices — <strong>an estimate</strong>, close to but not identical to your provider invoice (no taxes, discounts, or cached-token rates). Days are UTC.</p>';
+
+        echo '<div class="ogm-eqa-cost-stats">';
+        echo '<div class="ogm-eqa-stat"><div class="k">Month to date</div><div class="v">' . esc_html($usd($month_micros)) . '</div></div>';
+        echo '<div class="ogm-eqa-stat"><div class="k">Last 30 days</div><div class="v">' . esc_html($usd($d30_micros)) . '</div></div>';
+        echo '<div class="ogm-eqa-stat"><div class="k">Avg / scan</div><div class="v">' . esc_html($usd($avg)) . '</div></div>';
+        echo '<div class="ogm-eqa-stat"><div class="k">Scans (30d)</div><div class="v">' . esc_html(number_format($d30_scans)) . '</div></div>';
+        echo '</div>';
+
+        $s = self::settings();
+        $budget = (float)($s['monthly_budget_usd'] ?? 0);
+        if ($budget > 0) {
+            $used = $month_micros / 1000000;
+            $pct  = $budget > 0 ? min(100, (int) round($used / $budget * 100)) : 0;
+            $cls  = $used >= $budget ? 'is-bad' : ($pct >= 80 ? 'is-warn' : 'is-ok');
+            echo '<div class="ogm-eqa-card"><h2 class="ogm-eqa-card-title"><span class="dashicons dashicons-chart-pie" aria-hidden="true"></span> Monthly budget</h2>';
+            echo '<p>' . esc_html($usd($month_micros)) . ' of $' . esc_html(number_format($budget, 2)) . ' used this month (' . esc_html($pct) . '%).</p>';
+            echo '<div class="ogm-eqa-budget-bar ' . esc_attr($cls) . '"><span style="width:' . esc_attr($pct) . '%"></span></div>';
+            if ($used >= $budget) {
+                echo '<p class="description" style="color:#b32d2e;">Budget reached — scans are paused until next month, or raise the cap in <a href="' . esc_url(admin_url('admin.php?page=ogm-editorial-qa-settings')) . '">Settings</a>.</p>';
+            }
+            echo '</div>';
+        }
+
+        echo '<div class="ogm-eqa-card"><h2 class="ogm-eqa-card-title"><span class="dashicons dashicons-chart-bar" aria-hidden="true"></span> Daily spend — last 30 days</h2>';
+        if ($d30_micros <= 0) {
+            echo '<div class="ogm-eqa-empty">No scans with recorded cost in the last 30 days.</div>';
+        } else {
+            $max = 1;
+            $series = [];
+            for ($i = 29; $i >= 0; $i--) {
+                $day = gmdate('Y-m-d', time() - $i * DAY_IN_SECONDS);
+                $m = $by_day[$day] ?? 0;
+                $series[$day] = $m;
+                if ($m > $max) $max = $m;
+            }
+            echo '<div class="ogm-eqa-bars" role="img" aria-label="Daily estimated spend, last 30 days">';
+            foreach ($series as $day => $m) {
+                $h = $max > 0 ? max(2, (int) round($m / $max * 100)) : 0;
+                echo '<span title="' . esc_attr($day . ' — ' . $usd($m)) . '" style="height:' . esc_attr($h) . '%"></span>';
+            }
+            echo '</div>';
+        }
+        echo '</div>';
+
+        echo '<div class="ogm-eqa-card"><h2 class="ogm-eqa-card-title"><span class="dashicons dashicons-list-view" aria-hidden="true"></span> By model — month to date</h2>';
+        if (!$rows_model) {
+            echo '<div class="ogm-eqa-empty">No scans yet this month.</div>';
+        } else {
+            echo '<table class="ogm-eqa-cost-table"><thead><tr><th>Provider &middot; model</th><th class="r">Scans</th><th class="r">Input</th><th class="r">Output</th><th class="r">Est. cost</th></tr></thead><tbody>';
+            $any_fallback = false;
+            foreach ($rows_model as $r) {
+                $fallback = (self::price_for($r['model']) === null); // used a fallback estimate
+                if ($fallback) $any_fallback = true;
+                echo '<tr>';
+                echo '<td>' . esc_html($r['provider']) . ' &middot; <code>' . esc_html($r['model']) . '</code></td>';
+                echo '<td class="r">' . esc_html(number_format((int)$r['scans'])) . '</td>';
+                echo '<td class="r">' . esc_html(number_format((int)$r['in_t'])) . '</td>';
+                echo '<td class="r">' . esc_html(number_format((int)$r['out_t'])) . '</td>';
+                echo '<td class="r">' . esc_html($usd((int)$r['micros'])) . ($fallback ? ' <abbr title="No price-table entry — estimated with a conservative fallback rate.">*</abbr>' : '') . '</td>';
+                echo '</tr>';
+            }
+            echo '</tbody></table>';
+            if ($any_fallback) {
+                echo '<p class="description">* Model has no entry in the price table, so its cost uses a conservative fallback estimate (it still counts toward totals and the budget). Add exact prices via the <code>ogm_eqa_model_prices</code> filter.</p>';
+            }
+        }
+        echo '</div>';
+
+        echo '</div>'; // .wrap
+    }
+
     public static function render_settings_page() {
         if (!current_user_can('manage_options')) wp_die('Insufficient permissions.');
 
@@ -870,38 +1201,43 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         self::render_admin_header('ogm-editorial-qa-settings');
 
         echo '<div class="ogm-eqa-layout">';
-        echo '<div class="ogm-eqa-main"><div class="ogm-eqa-card">';
+        echo '<div class="ogm-eqa-main">';
         echo '<p class="ogm-eqa-intro">Pick a provider, add your API key, and choose a model. Scans run automatically in the background when a post enters one of the statuses you choose below.</p>';
 
         echo '<form method="post" action="options.php">';
         settings_fields(self::OPT_KEY);
 
+        // Progressive enhancement: JS hides the non-selected provider's rows.
+        // With JS off, reveal every provider row so both keys/models stay reachable.
+        echo '<noscript><style>.ogm-eqa-provider-row{display:table-row !important}</style></noscript>';
+
+        /* ---- Panel: AI provider ---- */
+        echo '<div class="ogm-eqa-card">';
+        echo '<h2 class="ogm-eqa-card-title"><span class="dashicons dashicons-superhero-alt" aria-hidden="true"></span> AI provider</h2>';
         echo '<table class="form-table" role="presentation">';
 
-        // Provider selector.
         $provider = self::active_provider($s);
         echo '<tr>';
-        echo '<th scope="row"><label for="ogm-eqa-provider">AI provider</label></th>';
+        echo '<th scope="row"><label for="ogm-eqa-provider">Provider</label></th>';
         echo '<td>';
         echo '<select id="ogm-eqa-provider" name="' . esc_attr(self::OPT_KEY) . '[provider]">';
         echo '<option value="openai"' . selected($provider, 'openai', false) . '>OpenAI</option>';
         echo '<option value="anthropic"' . selected($provider, 'anthropic', false) . '>Anthropic (Claude)</option>';
         echo '</select>';
-        echo '<p class="description">Which API to use for scanning. Configure that provider&rsquo;s key and model below.</p>';
+        echo '<p class="description">Only the selected provider&rsquo;s key and model are shown and used. The other is kept saved but hidden.</p>';
         echo '</td>';
         echo '</tr>';
 
-        // Per-provider key + model + refresh.
         self::render_provider_section($s, 'openai');
         self::render_provider_section($s, 'anthropic');
 
-        echo '<tr>';
-        echo '<th scope="row"><label for="ogm-eqa-max-tokens">Max output tokens</label></th>';
-        echo '<td>';
-        echo '<input id="ogm-eqa-max-tokens" name="' . esc_attr(self::OPT_KEY) . '[max_output_tokens]" type="number" min="' . esc_attr(self::MIN_TOKENS) . '" max="' . esc_attr(self::MAX_TOKENS) . '" value="' . esc_attr((int)$s['max_output_tokens']) . '" />';
-        echo '<p class="description">Caps how long the AI&rsquo;s reply can be for a <strong>single</strong> scan — i.e. how many typos it can list for one post. It is <strong>not</strong> a daily or monthly budget. The default (350) holds dozens of findings; only raise it if very long posts get cut off.</p>';
-        echo '</td>';
-        echo '</tr>';
+        echo '</table>';
+        echo '</div>'; // panel
+
+        /* ---- Panel: When to scan ---- */
+        echo '<div class="ogm-eqa-card">';
+        echo '<h2 class="ogm-eqa-card-title"><span class="dashicons dashicons-clock" aria-hidden="true"></span> When to scan</h2>';
+        echo '<table class="form-table" role="presentation">';
 
         echo '<tr>';
         echo '<th scope="row">Post types</th>';
@@ -913,6 +1249,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             echo esc_html($obj->labels->name);
             echo '</label>';
         }
+        echo '<p class="description">Which content types Editorial QA watches and decorates.</p>';
         echo '</td>';
         echo '</tr>';
 
@@ -933,6 +1270,30 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '</td>';
         echo '</tr>';
 
+        echo '</table>';
+        echo '</div>'; // panel
+
+        /* ---- Panel: Advanced ---- */
+        echo '<div class="ogm-eqa-card">';
+        echo '<h2 class="ogm-eqa-card-title"><span class="dashicons dashicons-admin-generic" aria-hidden="true"></span> Advanced</h2>';
+        echo '<table class="form-table" role="presentation">';
+
+        echo '<tr>';
+        echo '<th scope="row"><label for="ogm-eqa-max-tokens">Max output tokens</label></th>';
+        echo '<td>';
+        echo '<input id="ogm-eqa-max-tokens" name="' . esc_attr(self::OPT_KEY) . '[max_output_tokens]" type="number" min="' . esc_attr(self::MIN_TOKENS) . '" max="' . esc_attr(self::MAX_TOKENS) . '" value="' . esc_attr((int)$s['max_output_tokens']) . '" />';
+        echo '<p class="description">Caps how long the AI&rsquo;s reply can be for a <strong>single</strong> scan — i.e. how many typos it can list for one post. It is <strong>not</strong> a daily or monthly budget. The default (350) holds dozens of findings; only raise it if very long posts get cut off.</p>';
+        echo '</td>';
+        echo '</tr>';
+
+        echo '<tr>';
+        echo '<th scope="row"><label for="ogm-eqa-budget">Monthly budget</label></th>';
+        echo '<td>';
+        echo '$ <input id="ogm-eqa-budget" name="' . esc_attr(self::OPT_KEY) . '[monthly_budget_usd]" type="number" min="0" step="0.01" value="' . esc_attr((string)($s['monthly_budget_usd'] ?? 0)) . '" style="width:8em;" />';
+        echo '<p class="description">Optional safety cap on estimated spend per calendar month (UTC). Leave <strong>0</strong> for no cap. When exceeded, scans are skipped until the next month or you raise the cap. See <a href="' . esc_url(admin_url('admin.php?page=ogm-editorial-qa-costs')) . '">Costs</a>.</p>';
+        echo '</td>';
+        echo '</tr>';
+
         echo '<tr>';
         echo '<th scope="row">Behavior</th>';
         echo '<td>';
@@ -941,10 +1302,11 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '</tr>';
 
         echo '</table>';
+        echo '</div>'; // panel
 
         submit_button('Save Settings');
         echo '</form>';
-        echo '</div></div>'; // .ogm-eqa-card, .ogm-eqa-main
+        echo '</div>'; // .ogm-eqa-main
 
         echo '<aside class="ogm-eqa-sidebar">';
         self::render_settings_sidebar($s);
@@ -998,11 +1360,20 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $id_key    = 'ogm-eqa-' . $provider . '-key';
         $id_mdl    = 'ogm-eqa-' . $provider . '-model';
 
+        // Rows for the non-selected provider are hidden server-side (works
+        // without JS); a change handler on the provider dropdown toggles them.
+        $active    = self::active_provider($s);
+        $row_attr  = ' class="ogm-eqa-provider-row" data-provider="' . esc_attr($provider) . '"'
+            . ($provider !== $active ? ' style="display:none"' : '');
+
         // API key row.
-        echo '<tr>';
+        echo '<tr' . $row_attr . '>';
         echo '<th scope="row"><label for="' . esc_attr($id_key) . '">' . esc_html($label) . ' API key</label></th>';
         echo '<td>';
-        echo '<input id="' . esc_attr($id_key) . '" name="' . esc_attr(self::OPT_KEY) . '[' . esc_attr($key_field) . ']" type="password" class="regular-text" value="' . esc_attr((string)($s[$key_field] ?? '')) . '" autocomplete="off" />';
+        // When the wp-config constant supplies the key, render the field empty
+        // and disabled — never echo the secret into the page or submit it.
+        $key_val = $const_set ? '' : (string)($s[$key_field] ?? '');
+        echo '<input id="' . esc_attr($id_key) . '" name="' . esc_attr(self::OPT_KEY) . '[' . esc_attr($key_field) . ']" type="password" class="regular-text" value="' . esc_attr($key_val) . '" autocomplete="off"' . ($const_set ? ' disabled placeholder="Set in wp-config.php"' : '') . ' />';
         echo '<p class="description"><a href="' . esc_url($key_url) . '" target="_blank" rel="noopener">Create a ' . esc_html($label) . ' key at ' . esc_html($key_host) . ' <span class="dashicons dashicons-external" style="font-size:14px;width:14px;height:14px;vertical-align:text-bottom;"></span></a></p>';
         if ($const_set) {
             echo '<p class="description">Currently provided by <code>' . esc_html($const) . '</code> in wp-config.php — this field is ignored at runtime.</p>';
@@ -1013,7 +1384,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '</tr>';
 
         // Model row + refresh button.
-        echo '<tr>';
+        echo '<tr' . $row_attr . '>';
         echo '<th scope="row"><label for="' . esc_attr($id_mdl) . '">' . esc_html($label) . ' model</label></th>';
         echo '<td>';
 
@@ -1062,63 +1433,73 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
     public static function render_meta_box($post) {
         if (!($post instanceof WP_Post)) return;
 
-        $report = (string)get_post_meta($post->ID, self::META_REPORT, true);
-        $issues = (int)get_post_meta($post->ID, self::META_ISSUE_COUNT, true);
-        $last   = (string)get_post_meta($post->ID, self::META_LAST_SCANNED_GM, true);
-        
-        if ($last) {
-			// Convert the stored GMT timestamp to the site's configured timezone.
-			$last = get_date_from_gmt($last, 'Y-m-d H:i:s');
-		}
+        $issues   = (int)get_post_meta($post->ID, self::META_ISSUE_COUNT, true);
+        $last_raw = (string)get_post_meta($post->ID, self::META_LAST_SCANNED_GM, true);
+        $last     = $last_raw ? get_date_from_gmt($last_raw, 'Y-m-d H:i:s') : '';
+        $model    = (string)get_post_meta($post->ID, self::META_MODEL, true);
+        $err      = (string)get_post_meta($post->ID, self::META_ERROR, true);
+        $costm    = get_post_meta($post->ID, self::META_COST, true);
+        $cost_str = ($costm !== '' && $costm !== null) ? self::format_usd((int)$costm) : '';
 
-        $model  = (string)get_post_meta($post->ID, self::META_MODEL, true);
-        $err    = (string)get_post_meta($post->ID, self::META_ERROR, true);
-
-        $badge = $issues > 0 ? '<span class="ogm-eqa-badge ogm-eqa-badge-bad">Issues: '.esc_html($issues).'</span>'
-                             : '<span class="ogm-eqa-badge ogm-eqa-badge-good">Clean</span>';
+        if ($err !== '') {
+            $badge = '<span class="ogm-eqa-badge ogm-eqa-badge-bad">Error</span>';
+        } elseif ($last_raw === '') {
+            $badge = '<span class="ogm-eqa-badge-scanning">Not scanned</span>';
+        } else {
+            $badge = $issues > 0
+                ? '<span class="ogm-eqa-badge ogm-eqa-badge-bad">Issues: '.esc_html($issues).'</span>'
+                : '<span class="ogm-eqa-badge ogm-eqa-badge-good">Clean</span>';
+        }
 
         echo '<div class="ogm-eqa-metabox">';
-        echo $badge;
+        echo '<div class="ogm-eqa-badge-wrap">' . $badge . '</div>';
 
-        if ($last) {
-            echo '<p class="description" style="margin-top:6px;">Last scan: '.esc_html($last).'</p>';
-        }
+        echo '<p class="description ogm-eqa-lastscan" style="margin-top:6px;' . ($last ? '' : 'display:none;') . '">Last scan: <span class="ogm-eqa-lastscan-val">' . esc_html($last) . '</span></p>';
+        echo '<p class="description ogm-eqa-costline" style="margin-top:2px;' . ($cost_str ? '' : 'display:none;') . '">Est. cost: <span class="ogm-eqa-cost-val">' . esc_html($cost_str) . '</span></p>';
         if ($model) {
             echo '<p class="description" style="display:none;">Model: <code>'.esc_html($model).'</code></p>';
         }
-        if ($err) {
-            echo '<p style="color:#b32d2e;"><strong>Error:</strong> '.esc_html($err).'</p>';
-        }
+        echo '<p class="ogm-eqa-errline" style="color:#b32d2e;' . ($err ? '' : 'display:none;') . '"><strong>Error:</strong> <span class="ogm-eqa-err-val">' . esc_html($err) . '</span></p>';
 
-if ($report && stripos($report, 'No obvious typos detected.') === false) {
-
-echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or more of these may not actually be typos.</p>';
-    $lines = preg_split('/\r\n|\r|\n/', $report);
-
-    echo '<ol class="ogm-eqa-list">';
-
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if ($line === '') continue;
-
-        // Remove leading number like "1. "
-        $line = preg_replace('/^\d+\.?\s*/', '', $line);
-
-        echo '<li>' . esc_html($line) . '</li>';
-    }
-
-    echo '</ol>';
-
-} else {
-    echo '<div class="ogm-eqa-report">' . esc_html($report) . '</div>';
-}
+        // Hide the (possibly stale) report while an error is showing.
+        echo '<div class="ogm-eqa-report-wrap">' . ($err !== '' ? '' : self::render_report_html($post->ID)) . '</div>';
 
         echo '<p style="margin-top:10px;">';
-        echo '<button type="button" class="button ogm-eqa-rescan" data-post-id="'.esc_attr($post->ID).'" data-context="metabox">Rescan</button> ';
+        echo '<button type="button" class="button ogm-eqa-rescan" data-post-id="'.esc_attr($post->ID).'" data-context="metabox" data-scanned="'.esc_attr($last_raw).'">Rescan</button> ';
         echo '<span class="ogm-eqa-rescan-status" style="margin-left:6px;"></span>';
         echo '</p>';
 
         echo '</div>';
+    }
+
+    /** The report block HTML (disclaimer + numbered list, or the clean line). Shared by the meta box + Live Rescan poll. */
+    private static function render_report_html($post_id) {
+        $report = (string)get_post_meta($post_id, self::META_REPORT, true);
+        if ($report === '') return '';
+
+        if (stripos($report, 'No obvious typos detected.') !== false) {
+            return '<div class="ogm-eqa-report">' . esc_html($report) . '</div>';
+        }
+
+        $out  = '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or more of these may not actually be typos.</p>';
+        $out .= '<ol class="ogm-eqa-list">';
+        foreach (preg_split('/\r\n|\r|\n/', $report) as $line) {
+            $line = trim($line);
+            if ($line === '') continue;
+            $line = preg_replace('/^\d+\.?\s*/', '', $line);
+            $out .= '<li>' . esc_html($line) . '</li>';
+        }
+        $out .= '</ol>';
+        return $out;
+    }
+
+    /** Format micro-USD as a compact dollar string. */
+    public static function format_usd($micros) {
+        $v = $micros / 1000000;
+        if ($v == 0)     return '$0.00';
+        if ($v >= 0.10)  return '$' . number_format($v, 2);
+        if ($v >= 0.001) return '$' . number_format($v, 4);
+        return '$' . number_format($v, 6);
     }
 
     /** --------- Posts list table column --------- */
@@ -1164,7 +1545,7 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
 
         if ($err) {
             echo '<span class="ogm-eqa-badge ogm-eqa-badge-bad" title="'.esc_attr($err).'">!</span>';
-            echo '<div style="margin-top:6px;"><button type="button" class="button button-small ogm-eqa-rescan" data-post-id="'.esc_attr($post_id).'" data-context="postslist">Rescan</button></div>';
+            echo '<div style="margin-top:6px;"><button type="button" class="button button-small ogm-eqa-rescan" data-post-id="'.esc_attr($post_id).'" data-context="postslist" data-scanned="'.esc_attr($last).'">Rescan</button></div>';
             echo '<div class="ogm-eqa-rescan-status" style="margin-top:6px;"></div>';
             return;
         }
@@ -1176,7 +1557,7 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
         }
 
         echo '<div style="margin-top:6px;">';
-        echo '<button type="button" class="button button-small ogm-eqa-rescan" data-post-id="'.esc_attr($post_id).'" data-context="postslist">Rescan</button>';
+        echo '<button type="button" class="button button-small ogm-eqa-rescan" data-post-id="'.esc_attr($post_id).'" data-context="postslist" data-scanned="'.esc_attr($last).'">Rescan</button>';
         echo '</div>';
         echo '<div class="ogm-eqa-rescan-status" style="margin-top:6px;"></div>';
     }
@@ -1216,9 +1597,57 @@ echo '<p class="ogm-eqa-disclaimer">Heads up — AI isn&rsquo;t perfect. One or 
             wp_send_json_error(['message' => 'Post not found.'], 404);
         }
 
+        // Per-post authorization: the broad cap above isn't enough — require
+        // edit rights on THIS specific post before sending it to the provider.
+        if (!current_user_can('edit_post', $post_id)) {
+            wp_send_json_error(['message' => 'You are not allowed to scan this post.'], 403);
+        }
+
         self::queue_scan($post_id, get_current_user_id(), true);
 
-        wp_send_json_success(['message' => 'Rescan queued. Refresh in a few seconds.']);
+        wp_send_json_success(['message' => 'Scanning…']);
+    }
+
+    /**
+     * Poll endpoint for Live Rescan. Reads the post's current scan state from
+     * the DB and returns it as JSON — NO AI call, so polling is free.
+     */
+    public static function ajax_scan_status() {
+        if (!current_user_can('edit_others_posts')) {
+            wp_send_json_error(['message' => 'Insufficient permissions.'], 403);
+        }
+        check_ajax_referer('ogm_eqa_scan_status', 'nonce');
+
+        $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
+        if (!$post_id || !get_post($post_id)) {
+            wp_send_json_error(['message' => 'Post not found.'], 404);
+        }
+        if (!current_user_can('edit_post', $post_id)) {
+            wp_send_json_error(['message' => 'Not allowed.'], 403);
+        }
+
+        $scanned = (string)get_post_meta($post_id, self::META_LAST_SCANNED_GM, true);
+        $err     = (string)get_post_meta($post_id, self::META_ERROR, true);
+        $issues  = (int)get_post_meta($post_id, self::META_ISSUE_COUNT, true);
+        $costm   = get_post_meta($post_id, self::META_COST, true);
+
+        // Password-protected posts are never scanned; report it so the poll
+        // resolves cleanly (their QA meta is cleared, so scanned_gmt is empty).
+        if ((string)get_post_field('post_password', $post_id) !== '') {
+            $status = 'skipped';
+        } else {
+            $status = $err !== '' ? 'error' : ($scanned === '' ? 'none' : ($issues > 0 ? 'issues' : 'clean'));
+        }
+
+        wp_send_json_success([
+            'scanned_gmt'   => $scanned,
+            'scanned_local' => $scanned ? get_date_from_gmt($scanned, 'Y-m-d H:i:s') : '',
+            'status'        => $status,
+            'issues'        => $issues,
+            'error'         => $err,
+            'cost'          => ($costm !== '' && $costm !== null) ? self::format_usd((int)$costm) : '',
+            'report_html'   => self::render_report_html($post_id),
+        ]);
     }
 
     /** --------- Model list (dropdown + refresh) --------- */
@@ -1609,7 +2038,8 @@ if (is_admin()) {
                     return '<code>'.esc_html(get_date_from_gmt($last, 'Y-m-d H:i')).'</code>';
 
                 case 'actions':
-                    $btn = '<button type="button" class="button ogm-eqa-rescan" data-post-id="'.esc_attr($item->ID).'" data-context="table">Rescan</button>';
+                    $scanned = (string)get_post_meta($item->ID, OGM_Editorial_QA::META_LAST_SCANNED_GM, true);
+                    $btn = '<button type="button" class="button ogm-eqa-rescan" data-post-id="'.esc_attr($item->ID).'" data-context="table" data-scanned="'.esc_attr($scanned).'">Rescan</button>';
                     $view = '<a class="button" href="'.esc_url(get_edit_post_link($item->ID)).'">View</a>';
                     return $btn . ' ' . $view . '<div class="ogm-eqa-rescan-status" style="margin-top:6px;"></div>';
             }
@@ -1620,3 +2050,6 @@ if (is_admin()) {
 }
 
 OGM_Editorial_QA::init();
+
+// Create the cost-ledger table on activation (also self-heals via maybe_upgrade on admin_init).
+register_activation_hook(__FILE__, ['OGM_Editorial_QA', 'maybe_upgrade']);

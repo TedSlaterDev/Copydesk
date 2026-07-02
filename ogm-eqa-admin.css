@@ -16,6 +16,21 @@
 .ogm-eqa-badge-good { background: #e7f7ed; color: #146c2e; border: 1px solid #b7e3c6; }
 .ogm-eqa-badge-bad  { background: #fde8e8; color: #b32d2e; border: 1px solid #f5b5b5; }
 
+/* Transient state shown while a Live Rescan is in flight */
+.ogm-eqa-badge-scanning {
+	display: inline-block;
+	min-width: 22px;
+	padding: 2px 9px;
+	border-radius: 999px;
+	font-weight: 600;
+	font-size: 12px;
+	line-height: 18px;
+	text-align: center;
+	background: #f6f7f7;
+	color: #646970;
+	border: 1px solid #e2e2e4;
+}
+
 /* ---------- Branded screen header (Reports + Settings) ---------- */
 .ogm-eqa-screen { max-width: 1120px; }
 
@@ -125,6 +140,26 @@
 	color: #646970;
 	font-size: .92rem;
 }
+
+/* Panel (card) heading */
+.ogm-eqa-card-title {
+	display: flex;
+	align-items: center;
+	gap: .45rem;
+	margin: 0 0 .35rem;
+	padding: 0;
+	font-size: 1.05rem;
+	line-height: 1.3;
+	color: #1d2327;
+}
+.ogm-eqa-card-title .dashicons {
+	color: #4b7a3f;
+	font-size: 20px;
+	width: 20px;
+	height: 20px;
+}
+/* First form-table row in a panel sits right under the title — no extra top rule */
+.ogm-eqa-card .ogm-eqa-card-title + .form-table tr:first-child { border-top: none; }
 
 /* Form table inside the card */
 .ogm-eqa-card .form-table { margin-top: .25rem; }
@@ -272,3 +307,36 @@ ol.ogm-eqa-list span { color: #777; }
 /* Settings: "Refresh models" inline status */
 .ogm-eqa-refresh-status { margin-left: .4rem; color: #50575e; font-style: italic; font-size: .9rem; }
 .ogm-eqa-refresh-status.ogm-eqa-refresh-error { color: #b32d2e; font-style: normal; font-weight: 600; }
+
+/* ---------- Costs page ---------- */
+.ogm-eqa-cost-stats { display: flex; gap: .6rem; flex-wrap: wrap; margin: 0 0 1.25rem; }
+.ogm-eqa-stat {
+	flex: 1 1 140px;
+	background: #fff;
+	border: 1px solid #dcdcde;
+	border-radius: 10px;
+	padding: .7rem .9rem;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
+}
+.ogm-eqa-stat .k { font-size: .68rem; text-transform: uppercase; letter-spacing: .03em; color: #8c8f94; }
+.ogm-eqa-stat .v { font-size: 1.4rem; font-weight: 700; margin-top: .15rem; color: #1d2327; }
+
+.ogm-eqa-bars { display: flex; align-items: flex-end; gap: 3px; height: 90px; margin: .3rem 0 .2rem; }
+.ogm-eqa-bars span { flex: 1; background: #5b8c3e; border-radius: 2px 2px 0 0; min-height: 2px; opacity: .85; }
+.ogm-eqa-bars span:hover { opacity: 1; }
+
+.ogm-eqa-cost-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ogm-eqa-cost-table th {
+	text-align: left; color: #8c8f94; font-size: .68rem; text-transform: uppercase; letter-spacing: .03em;
+	border-bottom: 1px solid #eef0f1; padding: .4rem .3rem;
+}
+.ogm-eqa-cost-table td { border-bottom: 1px solid #f4f5f6; padding: .45rem .3rem; }
+.ogm-eqa-cost-table th.r, .ogm-eqa-cost-table td.r { text-align: right; }
+.ogm-eqa-cost-table code { background: #f6f7f7; border: 1px solid #e6e7e8; border-radius: 4px; padding: 0 5px; font-size: 12px; }
+
+.ogm-eqa-budget-bar { height: 10px; background: #eef0f1; border-radius: 999px; overflow: hidden; margin: .3rem 0; }
+.ogm-eqa-budget-bar span { display: block; height: 100%; background: #5b8c3e; }
+.ogm-eqa-budget-bar.is-warn span { background: #dba617; }
+.ogm-eqa-budget-bar.is-bad span { background: #d63638; }
+
+.ogm-eqa-empty { color: #646970; font-style: italic; padding: .4rem 0; }
