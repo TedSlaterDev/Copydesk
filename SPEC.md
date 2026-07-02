@@ -2,7 +2,7 @@
 
 **Plugin:** Editorial QA (AI Typos)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.10.0
+**Version of record:** 1.10.1
 **Requires:** WordPress 6.0+, PHP 8.0+
 **Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
@@ -260,7 +260,7 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 - **Pricing.** `model_prices()` (filter `ogm_eqa_model_prices`) maps canonical model IDs → USD per 1M `['in','out']`. `price_for()` does a **longest-prefix** match (so dated IDs like `gpt-4o-mini-2024-…` / `claude-haiku-4-5-20251001` resolve). `cost_micros()` = `round(in·inPrice + out·outPrice)` in micro-USD, or **null** when unpriced (tokens still recorded; cost excluded). All costs are **estimates** from list prices.
 - **Costs screen** (`page=ogm-editorial-qa-costs`, cap `manage_options`, third header tab): stat cards (month-to-date / last-30-days / avg-per-scan / scans), a CSS daily-spend bar chart, a by-provider·model table, and a budget-progress bar when a cap is set — all aggregated from the ledger via `$wpdb` (table name interpolated from `$wpdb->prefix`; values via `prepare()`).
 - **Budget cap.** `monthly_budget_usd` > 0 → `scan_post_job` compares `month_spend_micros()` to the cap before calling the provider and, if reached, stores a note and returns.
-- **Live Rescan.** Clicking Rescan POSTs `ogm_eqa_rescan` (forces a scan, always updating `_ogm_eqa_last_scanned_gmt`), then the JS polls `ogm_eqa_scan_status` (~2.5s × ≤12) until `scanned_gmt` differs from the button's `data-scanned` baseline, then updates the badge (per `data-context`), status line, and — in the meta box — the report (`render_report_html()`) and cost, in place. Polling reads the DB only; **zero AI cost**. Password-protected posts clear their QA meta and are skipped.
+- **Live Rescan.** Clicking Rescan POSTs `ogm_eqa_rescan`, which runs the scan **synchronously in-request** (`scan_post_job(..., force=1)`, `@set_time_limit(120)`) and returns the fresh state via `scan_status_payload()`. The JS applies it immediately (badge per `data-context`, status line, and — in the meta box — the report via `render_report_html()` + cost). This is the single AI call the user already triggered; the previous cron-queued approach was replaced because WP-Cron often doesn't fire within the browser's wait, leaving the poll stuck on "Still working." `ajax_scan_status` + `eqaPoll` remain as a fallback (also DB-only, zero AI cost). Password-protected posts clear their QA meta and return `status: 'skipped'`.
 
 ---
 

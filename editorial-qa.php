@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.10.0
+ * Version:           1.10.1
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.10.0');
+define('OGM_EQA_VERSION', '1.10.1');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -1603,14 +1603,17 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             wp_send_json_error(['message' => 'You are not allowed to scan this post.'], 403);
         }
 
-        self::queue_scan($post_id, get_current_user_id(), true);
+        // Run the scan inline (not via cron) so the result is ready immediately —
+        // Live Rescan can't rely on WP-Cron firing within the browser's wait.
+        @set_time_limit(120);
+        self::scan_post_job($post_id, get_current_user_id(), 1);
 
-        wp_send_json_success(['message' => 'Scanning…']);
+        wp_send_json_success(self::scan_status_payload($post_id));
     }
 
     /**
-     * Poll endpoint for Live Rescan. Reads the post's current scan state from
-     * the DB and returns it as JSON — NO AI call, so polling is free.
+     * Poll endpoint for Live Rescan (fallback path). Reads the post's current
+     * scan state from the DB and returns it as JSON — NO AI call.
      */
     public static function ajax_scan_status() {
         if (!current_user_can('edit_others_posts')) {
@@ -1626,20 +1629,23 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             wp_send_json_error(['message' => 'Not allowed.'], 403);
         }
 
+        wp_send_json_success(self::scan_status_payload($post_id));
+    }
+
+    /** The post's current scan state as a plain array (shared by rescan + poll). */
+    private static function scan_status_payload($post_id) {
         $scanned = (string)get_post_meta($post_id, self::META_LAST_SCANNED_GM, true);
         $err     = (string)get_post_meta($post_id, self::META_ERROR, true);
         $issues  = (int)get_post_meta($post_id, self::META_ISSUE_COUNT, true);
         $costm   = get_post_meta($post_id, self::META_COST, true);
 
-        // Password-protected posts are never scanned; report it so the poll
-        // resolves cleanly (their QA meta is cleared, so scanned_gmt is empty).
         if ((string)get_post_field('post_password', $post_id) !== '') {
             $status = 'skipped';
         } else {
             $status = $err !== '' ? 'error' : ($scanned === '' ? 'none' : ($issues > 0 ? 'issues' : 'clean'));
         }
 
-        wp_send_json_success([
+        return [
             'scanned_gmt'   => $scanned,
             'scanned_local' => $scanned ? get_date_from_gmt($scanned, 'Y-m-d H:i:s') : '',
             'status'        => $status,
@@ -1647,7 +1653,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             'error'         => $err,
             'cost'          => ($costm !== '' && $costm !== null) ? self::format_usd((int)$costm) : '',
             'report_html'   => self::render_report_html($post_id),
-        ]);
+        ];
     }
 
     /** --------- Model list (dropdown + refresh) --------- */

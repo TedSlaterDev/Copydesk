@@ -97,10 +97,16 @@ jQuery(function($){
       nonce: OGM_EQA.nonce,
       post_id: postId
     }).done(function(resp){
-      if(resp && resp.success){
+      var d = (resp && resp.data) ? resp.data : null;
+      if(resp && resp.success && d && d.status){
+        // Scan ran synchronously — apply the result immediately.
+        eqaApplyResult($btn, $wrap, $status, d);
+        $btn.prop('disabled', false);
+      } else if(resp && resp.success){
+        // Fallback: older/async response with no result — poll for it.
         eqaPoll(postId, baseline, $btn, $wrap, $status, 12);
       } else {
-        $status.text((resp && resp.data && resp.data.message) ? resp.data.message : 'Error.');
+        $status.text((d && d.message) ? d.message : 'Error.');
         $btn.prop('disabled', false);
       }
     }).fail(function(xhr){

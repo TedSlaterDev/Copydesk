@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.10.0
+**Stable tag:** 1.10.1
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -108,6 +108,9 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 3. The sortable "QA" column on the Posts list.
 
 ## Changelog
+
+### 1.10.1
+- **Fixed Live Rescan** getting stuck on "Still working — reload to check." The manual Rescan now runs the scan **in-request** and returns the result immediately, instead of waiting on WP‑Cron (which many hosts don't fire promptly). You now always get the result — or a clear error — right away.
 
 ### 1.10.0
 - **Live Rescan** — clicking Rescan now shows a "Scanning…" state and updates the badge/report in place when the scan lands, no manual reload. This adds **no** usage cost: the scan is the same single API call, and the live update is the browser polling WordPress for the stored result (it never calls the AI provider).
