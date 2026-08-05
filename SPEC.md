@@ -2,7 +2,7 @@
 
 **Plugin:** Editorial QA (AI Typos)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.10.1
+**Version of record:** 1.12.0
 **Requires:** WordPress 6.0+, PHP 8.0+
 **Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
@@ -85,18 +85,18 @@ A post must belong to an enabled post type (`post_types` setting) to trigger.
 
 ### 4.1 Text preparation (`prepare_text_for_scan`)
 
-1. `strip_shortcodes()` on the body.
+1. Preserve classic-editor `[caption]` **text** (the inner markup is removed by later passes) — then `strip_shortcodes()` on the body.
 2. Remove HTML comments (`<!-- … -->`) — editor notes and block-editor delimiters (`<!-- wp:… -->`) are never proofreadable content.
-3. Remove URL/tracking attribute values (`href`, `src`, `srcset`, `data-*`) so they aren't transmitted even when `strip_html` is off.
-4. Remove all `<blockquote>…</blockquote>` content (regex, dot-all, case-insensitive).
+3. Remove URL/tracking attribute values (`href`, `src`, `srcset`, `data-*`) so they aren't transmitted even when `strip_html` is off (scoped to tag interiors — prose like "set src = 42" is untouched).
+4. Remove all `<blockquote>…</blockquote>` content — innermost-first loop, so **nested** quotes can't leak; each removal substitutes a newline boundary.
 5. Remove `<script>`/`<style>` blocks **with their contents** — always, even when `strip_html` is off (embed code is never proofreadable text).
-6. Convert block-level boundaries (`<br>`, `</p>`, `</div>`, `</h1–6>`, `</li>`, …) to newlines, so separate paragraphs/headings stay on separate lines.
+6. Convert block-level boundaries (`<br …>`, `</p>`, `</div>`, `</h1–6>`, `</li>`, `</td>`, `</th>`, `</dt>`, `</dd>`, `</caption>`, …) to newlines, so paragraphs, headings, and **table cells** stay on separate lines.
 7. Optionally `wp_strip_all_tags($content, false)` (the `strip_html` setting; on by default). The `false` **keeps line breaks** — collapsing them (the old `true`) glued e.g. a "WATCH:" heading to the next paragraph and produced false mid-sentence capitalization flags.
 8. `html_entity_decode()` (ENT_QUOTES | ENT_HTML5) on title and body.
 9. Unicode NFC normalization (`normalizer_normalize`) when `intl` is available.
-10. Strip zero-width / invisible characters (`U+200B–200D`, `U+FEFF`).
-11. Collapse runs of spaces/tabs; collapse 3+ newlines to 2; trim.
-12. **Cap the BODY** at `apply_filters('ogm_eqa_max_input_chars', 20000)` chars (0 disables); the title is never capped. Cost + privacy guard on very long posts.
+10. Strip invisible characters: soft hyphen `U+00AD` (recreated by `&shy;` decode), `U+200B–200F` (zero-widths + LRM/RLM), `U+2060` word joiner, `U+FEFF` BOM.
+11. Collapse runs of spaces/tabs/NBSP/narrow-NBSP to a single space; collapse 3+ newlines to 2; trim.
+12. **Cap the BODY** at `apply_filters('ogm_eqa_max_input_chars', 20000)` chars (0 disables), trimming back to a **word boundary** so the cut can't fabricate a half-word "misspelling"; the title is never capped.
 13. Emit a single payload string: `"TITLE:\n{title}\n\nBODY:\n{body}\n"`.
 
 Password-protected posts (`post_password` set) are **never scanned** — `scan_post_job` returns before preparing text.
@@ -188,7 +188,22 @@ N. LOCATION: change 'bad' to 'good'
 
 Issues are additionally dropped by `is_unwanted_case_change()` when the change is **case-only** and lowercases a **word-initial** capital (proper nouns, acronyms, headings, sentence/line starts) — the scanner can't distinguish those from real errors. Mid-word case fixes (`thE`→`the`) and capitalizing a word (`paris`→`Paris`) are unaffected. The prompt also instructs the model not to produce these.
 
+Further server-side guards (1.11.0–1.12.0):
+
+- **Dedup** — findings are keyed on `location + norm(bad) + norm(good)`; repeats of the same finding are listed once.
+- **Verbatim-presence (hallucination) guard** — `build_report_from_issues($issues, $haystack)` receives the exact scanned text from both providers; any finding whose `bad` doesn't occur in it is dropped. `norm()` is case-, whitespace-, and quote-style-insensitive (curly quotes/apostrophes → straight, en/em dashes → hyphen), so provider quote-style drift can't drop real findings. An empty `$haystack` disables the guard (back-compat).
+- **Per-segment location check (1.12.0)** — the haystack is split on the `TITLE:/BODY:` frame; a finding present only in the other segment is **relabeled** rather than dropped; present in neither → dropped.
+- **ALL-CAPS guard (1.12.0)** — `is_unwanted_case_change()` also rejects any case-only "fix" of a fully-uppercase word (`HUGE`→`Huge`).
+
+**Request tuning (1.12.0, OpenAI):** models matching `^o\d` or `gpt-5*` get `reasoning: {effort: low}` (hidden reasoning tokens share the `max_output_tokens` budget); all other OpenAI models get `temperature: 0`. Anthropic requests are deliberately left untuned (newer Claude models reject `temperature`).
+
+**Truncation detection (1.12.0):** OpenAI `status: incomplete` (reason `max_output_tokens`) and Anthropic `stop_reason: max_tokens` return a dedicated actionable error pointing at the Max output tokens setting instead of a generic parse failure. Provider `usage` is attached as `WP_Error` data, and `scan_post_job()` records it in the cost ledger so failed scans still count toward the monthly budget cap. Default `max_output_tokens` is now 1000 (existing installs keep their saved value).
+
 If no actionable issues remain, the report is the literal `"No obvious typos detected."`. Issue count is derived by `count_numbered_issues` (counts lines matching `^\d+[.)]\s`); a report containing "no obvious typos detected" forces count `0`.
+
+### 4.6 Scan instructions (system prompt)
+
+`default_typo_instructions()` is the built-in prompt (public, shown/edited in Settings → Advanced). `typo_instructions()` returns the admin's `custom_instructions` setting when non-empty, else the default. Sanitization collapses saved text identical to the (sanitized) default back to `''` so default improvements ship with plugin updates until the admin actually customizes. A **Reset to default** button refills the textarea client-side from a localized copy (`OGM_EQA.default_instructions`); the JSON schema is enforced independently of this prompt, so edits cannot break the report format.
 
 ---
 
@@ -223,6 +238,7 @@ Timestamps are stored in GMT and **displayed** converted to the site's configure
 | `trigger_statuses` | `['future']` | Post-status slugs whose entry triggers a scan (sanitized against `get_post_stati(['internal'=>false])`) |
 | `rescan_on_update` | `1` | Also scan on re-save while already in a trigger status |
 | `monthly_budget_usd` | `0` | Optional cap on estimated spend per UTC month; `0` = no cap. When reached, `scan_post_job` stores a note and skips. |
+| `custom_instructions` | `''` | Admin-edited system prompt; `''` = use `default_typo_instructions()` (tracks plugin updates). See §4.6. |
 
 **Legacy migration:** installs from ≤ 1.3.0 stored a single `api_key` / `model`
 (OpenAI). `settings()` maps these to `openai_api_key` / `openai_model` on read,

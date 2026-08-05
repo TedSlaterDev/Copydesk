@@ -5,7 +5,7 @@
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.10.1
+**Stable tag:** 1.12.0
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -108,6 +108,18 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 3. The sortable "QA" column on the Posts list.
 
 ## Changelog
+
+### 1.12.0
+- **Truncation is now detected and explained.** When a scan hits the Max output tokens limit (both providers), you get an actionable message pointing at the setting instead of a cryptic "could not be parsed" error — and the tokens spent still land in the Costs ledger.
+- **Reasoning models handled properly.** OpenAI o-series/GPT-5-family scans now run at low reasoning effort (typo scanning doesn't need deep reasoning), so the token budget goes to the report; other OpenAI models run at temperature 0 for deterministic results. Default Max output tokens raised to 1000 for new installs.
+- **Fewer false positives from formatting:** table cells no longer glue into fake misspellings; classic-editor `[caption]` text is now scanned; nested blockquotes are fully removed; soft hyphens and other invisible characters are stripped; over-long posts are cut at a word boundary; NBSPs fold into plain spaces.
+- **Fewer dropped real findings:** the verbatim guard now tolerates curly-vs-straight quote/dash differences, and TITLE/BODY mislabels are corrected instead of dropped. Fully-uppercase words (emphasis, headings) are never case-"fixed".
+- Stronger default prompt: rules for quoted speech, numbers, word-choice (their/there is out of scope), and truncated-input tails.
+
+### 1.11.0
+- **Better report quality.** Identical findings are now de-duplicated (models sometimes return the same typo twice), and a new verbatim-presence guard drops any finding whose flagged text doesn't actually appear in the post — the main source of "just wrong" reports.
+- **Editable scan instructions.** Settings → Advanced now shows the exact prompt sent to the AI with every scan. Edit it to tune what gets flagged (with a one-click Reset to default); while unedited, plugin updates keep improving the built-in prompt automatically.
+- The default prompt is stronger: the AI must copy flagged text verbatim, report each distinct issue exactly once, and skip anything it isn't confident about.
 
 ### 1.10.1
 - **Fixed Live Rescan** getting stuck on "Still working — reload to check." The manual Rescan now runs the scan **in-request** and returns the result immediately, instead of waiting on WP‑Cron (which many hosts don't fire promptly). You now always get the result — or a clear error — right away.

@@ -174,4 +174,13 @@ jQuery(function($){
   $(document).on('change', '#ogm-eqa-provider', eqaSyncProvider);
   eqaSyncProvider();
 
+  /* ---- Settings: reset the scan-instructions textarea to the default ---- */
+  $(document).on('click', '.ogm-eqa-reset-instructions', function(e){
+    e.preventDefault();
+    if(!OGM_EQA.default_instructions) return;
+    $('#ogm-eqa-instructions').val(OGM_EQA.default_instructions);
+    // Reflect the state badge immediately (it becomes official on Save).
+    $('.ogm-eqa-instructions-state').html('<span class="ogm-eqa-badge ogm-eqa-badge-good">default</span>');
+  });
+
 });

@@ -2,7 +2,7 @@
  /**
  * Plugin Name:       Editorial QA (AI Typos)
  * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.10.1
+ * Version:           1.12.0
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -15,7 +15,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.10.1');
+define('OGM_EQA_VERSION', '1.12.0');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -82,8 +82,11 @@ class OGM_Editorial_QA {
             'openai_model'      => 'gpt-4o-mini',
             'anthropic_api_key' => '',
             'anthropic_model'   => 'claude-haiku-4-5',
-            'max_output_tokens' => 350,
+            'max_output_tokens' => 1000,
             'monthly_budget_usd'=> 0, // 0 = no cap
+            // Custom scan instructions ('' = use the built-in default, which
+            // keeps improving with plugin updates).
+            'custom_instructions' => '',
             'post_types'        => ['post'],
             'strip_html'        => 1,
             // Post statuses whose entry triggers a scan. Default: Scheduled.
@@ -266,6 +269,12 @@ class OGM_Editorial_QA {
             : self::call_openai_for_typos($prepared, $api_key, $model, $max_tokens);
 
         if (is_wp_error($result)) {
+            // Even failed/truncated scans bill tokens — keep the ledger (and
+            // the monthly budget cap) honest by recording the attached usage.
+            $u = $result->get_error_data();
+            if (is_array($u) && (!empty($u['input_tokens']) || !empty($u['output_tokens']))) {
+                self::record_cost($provider, $model, $post_id, (int)$u['input_tokens'], (int)$u['output_tokens']);
+            }
             self::store_error($post_id, $result->get_error_message());
             return;
         }
@@ -277,7 +286,7 @@ class OGM_Editorial_QA {
         }
 
         $issue_count = self::count_numbered_issues($report);
-        if (stripos($report, 'no obvious typos detected') !== false) {
+        if (preg_match('/^no obvious typos detected\.?$/i', $report)) {
             $issue_count = 0;
         }
 
@@ -443,6 +452,11 @@ class OGM_Editorial_QA {
         $title = (string)$title;
         $content = (string)$content;
 
+		// Keep classic-editor [caption] TEXT before strip_shortcodes() would
+		// delete it — caption typos are content too. The inner <img> markup is
+		// removed by the attribute/tag passes below.
+		$content = preg_replace('#\[(?:wp_)?caption\b[^\]]*\](.*?)\[/(?:wp_)?caption\]#is', "$1\n", $content);
+
         $content = strip_shortcodes($content);
 
 		// Strip HTML comments — editor notes and Gutenberg block delimiters
@@ -456,12 +470,11 @@ class OGM_Editorial_QA {
 			return preg_replace('#\s(?:href|src|srcset|data-[a-z0-9_-]+)\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)#i', '', $m[0]);
 		}, $content);
 
-		// Remove ALL blockquote content (leave other HTML intact for later stripping/decoding)
-		$content = preg_replace(
-			'#<blockquote\b[^>]*>.*?</blockquote>#is',
-			'',
-			$content
-		);
+		// Remove ALL blockquote content, innermost-first so nested quotes can't
+		// leak their inner text, substituting a newline as a block boundary.
+		do {
+			$content = preg_replace('#<blockquote\b[^>]*>(?:(?!<blockquote\b).)*?</blockquote>#is', "\n", $content, -1, $bq_count);
+		} while ($bq_count);
 
 		// Remove <script>/<style> blocks WITH their contents — embed code
 		// (e.g. video players) is never proofreadable text. Always, even when
@@ -469,11 +482,11 @@ class OGM_Editorial_QA {
 		$content = preg_replace('#<(script|style)\b[^>]*>.*?</\1>#is', '', $content);
 
 		// Convert block-level boundaries to newlines BEFORE stripping tags, so
-		// separate paragraphs/headings stay on separate lines. Otherwise a
-		// heading like "WATCH:" and the next paragraph collapse into one line
-		// ("WATCH: Later …") and read as a mid-sentence capitalization error.
-		$content = preg_replace('#<br\s*/?>#i', "\n", $content);
-		$content = preg_replace('#</(?:p|div|h[1-6]|li|tr|section|article|header|footer|figure|figcaption|blockquote)>#i', "\n", $content);
+		// separate paragraphs/headings/table cells stay on separate lines.
+		// Otherwise "WATCH:" + next paragraph, or adjacent <td>s, glue into one
+		// token and read as capitalization/misspelling errors.
+		$content = preg_replace('#<br\b[^>]*>#i', "\n", $content);
+		$content = preg_replace('#</(?:p|div|h[1-6]|li|tr|td|th|dt|dd|caption|section|article|header|footer|figure|figcaption|blockquote)>#i', "\n", $content);
 
         if ($strip_html) {
             // false = keep line breaks (the whitespace pass below normalizes them).
@@ -489,23 +502,27 @@ class OGM_Editorial_QA {
 			$title   = normalizer_normalize($title, Normalizer::FORM_C);
 		}
 
-		// Remove zero-width / invisible characters
-		$content = preg_replace('/[\x{200B}-\x{200D}\x{FEFF}]/u', '', $content);
-		$title   = preg_replace('/[\x{200B}-\x{200D}\x{FEFF}]/u', '', $title);
+		// Remove invisible characters: soft hyphen (&shy;), zero-widths,
+		// LRM/RLM direction marks, word joiner, BOM. These otherwise create
+		// "change 'X' to 'X'"-looking findings or silently drop real ones.
+		$content = preg_replace('/[\x{00AD}\x{200B}-\x{200F}\x{2060}\x{FEFF}]/u', '', $content);
+		$title   = preg_replace('/[\x{00AD}\x{200B}-\x{200F}\x{2060}\x{FEFF}]/u', '', $title);
 
-		// Normalize whitespace
-		$content = preg_replace("/[ \t]+/u", " ", $content);
+		// Normalize whitespace (fold NBSP variants into plain spaces).
+		$content = preg_replace('/[ \t\x{00A0}\x{202F}]+/u', ' ', $content);
 		$content = preg_replace("/\n{3,}/u", "\n\n", $content);
 		$content = trim($content);
 
 		// Cap body length sent to the provider (cost + privacy guard). Filterable;
 		// set to 0 to disable. Applies to the BODY only — the title is always kept.
+		// Trim back to a word boundary so the cut can't fabricate a "misspelled"
+		// half-word at the tail.
 		$max_chars = (int) apply_filters('ogm_eqa_max_input_chars', 20000);
 		if ($max_chars > 0 && mb_strlen($content) > $max_chars) {
-			$content = rtrim(mb_substr($content, 0, $max_chars));
+			$content = rtrim(preg_replace('/\S+$/u', '', mb_substr($content, 0, $max_chars)));
 		}
 
-		$title = preg_replace("/[ \t]+/u", " ", $title);
+		$title = preg_replace('/[ \t\x{00A0}\x{202F}]+/u', ' ', $title);
 		$title = trim($title);
 
         return "TITLE:\n{$title}\n\nBODY:\n{$content}\n";
@@ -543,19 +560,35 @@ private static function request_json($endpoint, array $headers, array $body) {
     return $resp; // last attempt's response or WP_Error
 }
 
-/** Shared system prompt for both providers. Schema is the real enforcement. */
-private static function typo_instructions() {
+/** The built-in system prompt (both providers). Schema is the real enforcement. */
+public static function default_typo_instructions() {
     return <<<SYS
 Return ONLY structured JSON that matches the provided schema.
 Detect ONLY objective technical typos:
 - Misspellings
 - Duplicated words ("the the")
-- Broken capitalization ONLY when a capital letter appears in the MIDDLE of a word ("thE", "wOrld"). NEVER suggest lowercasing the first letter of a word. Proper nouns (names, places, brands, organizations such as "White House"), acronyms, all-caps labels/headings (e.g. "WATCH:"), and the first word of any sentence or line are correctly capitalized — do NOT flag them. Do NOT enforce title case or headline style. When unsure about capitalization, do not report it.
+- Broken capitalization ONLY when a capital letter appears in the MIDDLE of a word ("thE", "wOrld"). NEVER suggest lowercasing the first letter of a word. Proper nouns (names, places, brands, organizations such as "White House"), acronyms, all-caps labels/headings (e.g. "WATCH:"), and the first word of any sentence or line are correctly capitalized — do NOT flag them. A word written in ALL CAPITALS anywhere (emphasis, acronym, heading) is intentional — never flag a fully-uppercase word. Do NOT enforce title case or headline style. When unsure about capitalization, do not report it.
 - Clearly broken punctuation ("??", "!!", "..")
 - Do NOT provide any corrections relating to quotation marks or apostrophes, either curly or straight. Do NOT mention any of these characters: " ' “ ” ‘ ’
+Text inside quotation marks is someone's verbatim quote. Within quotes, report ONLY clear misspellings of ordinary words; never flag slang, grammar, capitalization, or repeated punctuation ("!!", "??") inside a quotation.
+Numbers: never rewrite numbers, change digits, or enforce number style (numerals vs words, AP style). Flag a number only when its formatting is objectively broken (e.g. "10,00" as a thousands grouping, "$5.00.00"), and if the intended value is not obvious, do not report it.
+Do not report a correctly-spelled word as the wrong word for its context (their/there, to/too, affect/effect) — word choice is out of scope.
 The text preserves line breaks. A capitalized word at the start of a line begins a new heading or paragraph — never treat it as a mid-sentence error, even if the previous line ended without a period.
+The text may be cut off at the very end — never flag the final word of the input.
+Copy each 'bad' value VERBATIM from the text — never paraphrase, shorten, or re-space it. If it does not appear character-for-character in the text, do not report it.
+Report each distinct issue exactly ONCE. If the same typo occurs in several places, one report covers all of them. Never list the same bad/good pair twice.
+Only report an issue when you are CONFIDENT it is a genuine typo; when in doubt, leave it out. An empty issues list is a perfectly good answer.
 No commentary. No "no correction needed". No political/tone/style remarks.
 SYS;
+}
+
+/**
+ * Effective system prompt: the admin's customized instructions when set
+ * (Settings → Advanced), otherwise the built-in default above.
+ */
+private static function typo_instructions() {
+    $custom = trim((string)(self::settings()['custom_instructions'] ?? ''));
+    return $custom !== '' ? $custom : self::default_typo_instructions();
 }
 
 private static function call_openai_for_typos($text, $api_key, $model, $max_output_tokens) {
@@ -623,6 +656,18 @@ $body = [
     ],
 ];
 
+    // Model-family request tuning:
+    // - Reasoning models (o*, gpt-5*) spend hidden reasoning tokens from the
+    //   same max_output_tokens budget — cap that at low effort so the budget
+    //   goes to the actual report. (These models reject `temperature`.)
+    // - Sampling models get temperature 0: typo extraction should be
+    //   deterministic, not creative.
+    if (preg_match('/^o\d/i', $model) || strpos($model, 'gpt-5') === 0) {
+        $body['reasoning'] = ['effort' => 'low'];
+    } else {
+        $body['temperature'] = 0;
+    }
+
     $resp = self::request_json($endpoint, [
         'Authorization' => 'Bearer ' . trim($api_key),
         'Content-Type'  => 'application/json',
@@ -641,35 +686,78 @@ $body = [
         $msg = $json['error']['message'] ?? ('OpenAI error (HTTP ' . $code . ').');
         return new WP_Error('ogm_eqa_http_error', sanitize_text_field($msg));
     }
+
+    $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
+    $usage_data = [
+        'input_tokens'  => (int)($usage['input_tokens'] ?? 0),
+        'output_tokens' => (int)($usage['output_tokens'] ?? 0),
+    ];
+
+    // Truncation: HTTP 200 but the token cap cut the response (reasoning
+    // models can spend the whole budget before emitting any JSON). Surface an
+    // actionable message instead of a generic parse error; carry usage so the
+    // spend still lands in the cost ledger.
+    if (($json['status'] ?? '') === 'incomplete') {
+        $reason = (string)($json['incomplete_details']['reason'] ?? 'unknown');
+        if ($reason === 'max_output_tokens') {
+            return new WP_Error('ogm_eqa_truncated', 'The scan hit the Max output tokens limit before the report finished (reasoning models spend this budget on hidden reasoning too). Raise "Max output tokens" in Editorial QA → Settings → Advanced.', $usage_data);
+        }
+        return new WP_Error('ogm_eqa_incomplete', 'OpenAI returned an incomplete response (' . sanitize_text_field($reason) . ').', $usage_data);
+    }
+
     // Extract the structured payload regardless of where the Responses API placed it.
     $payload = self::extract_structured_payload_fallback($json);
 
     if (!is_array($payload)) {
         // Never store raw response bodies (privacy); log for debugging only.
         self::debug_log('OpenAI response not parseable as structured JSON. Snippet: ' . mb_substr($raw, 0, 400));
-        return new WP_Error('ogm_eqa_empty', 'The model response could not be parsed as structured JSON.');
+        return new WP_Error('ogm_eqa_empty', 'The model response could not be parsed as structured JSON.', $usage_data);
     }
 
     if (!isset($payload['issues']) || !is_array($payload['issues'])) {
         self::debug_log('OpenAI structured payload missing issues[]: ' . mb_substr(wp_json_encode($payload), 0, 300));
-        return new WP_Error('ogm_eqa_bad_structured', 'The model returned an unexpected response shape.');
+        return new WP_Error('ogm_eqa_bad_structured', 'The model returned an unexpected response shape.', $usage_data);
     }
 
-    $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
     return [
-        'report'        => self::build_report_from_issues($payload['issues']),
-        'input_tokens'  => (int)($usage['input_tokens'] ?? 0),
-        'output_tokens' => (int)($usage['output_tokens'] ?? 0),
+        'report'        => self::build_report_from_issues($payload['issues'], $text),
+        'input_tokens'  => $usage_data['input_tokens'],
+        'output_tokens' => $usage_data['output_tokens'],
     ];
 }
 
 /**
  * Build the numbered, human-readable report from validated issues only
  * (no model commentary can leak through). Shared by both providers.
+ *
+ * @param array  $issues   Structured issues from the model.
+ * @param string $haystack The exact text that was scanned; when non-empty,
+ *                         findings whose 'bad' text doesn't appear in it are
+ *                         dropped (hallucination guard).
  */
-private static function build_report_from_issues($issues) {
+private static function build_report_from_issues($issues, $haystack = '') {
     $lines = [];
+    $seen  = [];
     $n = 1;
+
+    // Whitespace-, case-, and quote-style-insensitive presence check: models
+    // often echo curly quotes/dashes as straight ones (or vice versa), which
+    // must not drop a real finding.
+    $norm = function ($t) {
+        $t = str_replace(["\u{2018}", "\u{2019}", "\u{201A}", "\u{201B}", "\u{02BC}"], "'", (string)$t);
+        $t = str_replace(["\u{201C}", "\u{201D}", "\u{201E}", "\u{201F}"], '"', $t);
+        $t = str_replace(["\u{2013}", "\u{2014}"], '-', $t);
+        return mb_strtolower(preg_replace('/\s+/u', ' ', $t));
+    };
+    $hay = $haystack !== '' ? $norm($haystack) : '';
+
+    // Split the haystack into TITLE/BODY segments so a finding's location can
+    // be verified (and corrected) instead of matching against the whole text.
+    $title_hay = null; $body_hay = null;
+    if ($hay !== '' && preg_match('/^TITLE:\n(.*?)\n\nBODY:\n(.*)$/su', $haystack, $hm)) {
+        $title_hay = $norm($hm[1]);
+        $body_hay  = $norm($hm[2]);
+    }
 
     foreach ((array)$issues as $iss) {
         if (!is_array($iss)) continue;
@@ -686,6 +774,26 @@ private static function build_report_from_issues($issues) {
         // letter (proper nouns, headings, sentence/line starts). The scanner
         // can't tell these from real errors, so they're almost always wrong.
         if (self::is_unwanted_case_change($bad, $good)) continue;
+
+        // Hallucination guard: the flagged text must actually occur in what
+        // was scanned. Models sometimes invent or paraphrase 'bad' — drop it.
+        // When the TITLE/BODY split is available, verify per segment and
+        // relabel a mislabeled location rather than dropping a real finding.
+        $nbad = $norm($bad);
+        if ($title_hay !== null && $body_hay !== null) {
+            $in_title = mb_strpos($title_hay, $nbad) !== false;
+            $in_body  = mb_strpos($body_hay, $nbad) !== false;
+            if (!$in_title && !$in_body) continue;
+            if ($loc === 'TITLE' && !$in_title) $loc = 'BODY';
+            if ($loc === 'BODY' && !$in_body)  $loc = 'TITLE';
+        } elseif ($hay !== '' && mb_strpos($hay, $nbad) === false) {
+            continue;
+        }
+
+        // Dedup: models sometimes return the same finding more than once.
+        $key = $loc . '|' . $norm($bad) . '|' . $norm($good);
+        if (isset($seen[$key])) continue;
+        $seen[$key] = true;
 
         // Keep output compact and consistent.
         $bad_esc  = str_replace(["\r", "\n"], [' ', ' '], $bad);
@@ -707,6 +815,11 @@ private static function build_report_from_issues($issues) {
 private static function is_unwanted_case_change($bad, $good) {
     if (mb_strtolower($bad) !== mb_strtolower($good)) {
         return false; // not a pure case change (different letters)
+    }
+    // A fully-uppercase source (emphasis, acronym, heading — "HUGE", "WATCH")
+    // is intentional; any case-only "fix" of it is unwanted.
+    if (mb_strtoupper($bad) === $bad && mb_strtolower($bad) !== $bad) {
+        return true;
     }
     $bw = preg_split('/\s+/u', trim($bad), -1, PREG_SPLIT_NO_EMPTY);
     $gw = preg_split('/\s+/u', trim($good), -1, PREG_SPLIT_NO_EMPTY);
@@ -792,8 +905,20 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         return new WP_Error('ogm_eqa_http_error', sanitize_text_field($msg));
     }
 
+    $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
+    $usage_data = [
+        'input_tokens'  => (int)($usage['input_tokens'] ?? 0),
+        'output_tokens' => (int)($usage['output_tokens'] ?? 0),
+    ];
+
     if (($json['stop_reason'] ?? '') === 'refusal') {
-        return new WP_Error('ogm_eqa_refusal', 'Anthropic declined to process this content.');
+        return new WP_Error('ogm_eqa_refusal', 'Anthropic declined to process this content.', $usage_data);
+    }
+
+    // Truncation: HTTP 200 but the token cap cut the JSON mid-stream (models
+    // with extended thinking spend this budget on thinking too).
+    if (($json['stop_reason'] ?? '') === 'max_tokens') {
+        return new WP_Error('ogm_eqa_truncated', 'The scan hit the Max output tokens limit before the report finished (models with extended thinking spend this budget on thinking too). Raise "Max output tokens" in Editorial QA → Settings → Advanced.', $usage_data);
     }
 
     // Structured output arrives as the first text content block (JSON string).
@@ -810,14 +935,13 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
     $payload = json_decode(trim($out_text), true);
     if (!is_array($payload) || !isset($payload['issues']) || !is_array($payload['issues'])) {
         self::debug_log('Anthropic response not parseable as structured JSON. Snippet: ' . mb_substr($raw, 0, 400));
-        return new WP_Error('ogm_eqa_bad_structured', 'The response could not be parsed as structured JSON.');
+        return new WP_Error('ogm_eqa_bad_structured', 'The response could not be parsed as structured JSON.', $usage_data);
     }
 
-    $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
     return [
-        'report'        => self::build_report_from_issues($payload['issues']),
-        'input_tokens'  => (int)($usage['input_tokens'] ?? 0),
-        'output_tokens' => (int)($usage['output_tokens'] ?? 0),
+        'report'        => self::build_report_from_issues($payload['issues'], $text),
+        'input_tokens'  => $usage_data['input_tokens'],
+        'output_tokens' => $usage_data['output_tokens'],
     ];
 }
 
@@ -965,6 +1089,12 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
         $out['monthly_budget_usd'] = isset($input['monthly_budget_usd']) ? max(0, (float)$input['monthly_budget_usd']) : $d['monthly_budget_usd'];
 
+        // Custom scan instructions. If the admin saves text identical to the
+        // built-in default, store '' so future default improvements apply.
+        $ci = isset($input['custom_instructions']) ? trim(sanitize_textarea_field((string)$input['custom_instructions'])) : '';
+        if ($ci === trim(sanitize_textarea_field(self::default_typo_instructions()))) $ci = '';
+        $out['custom_instructions'] = $ci;
+
         $out['strip_html'] = empty($input['strip_html']) ? 0 : 1;
         $out['rescan_on_update'] = empty($input['rescan_on_update']) ? 0 : 1;
 
@@ -1014,6 +1144,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             'nonce'         => wp_create_nonce('ogm_eqa_rescan'),
             'status_nonce'  => wp_create_nonce('ogm_eqa_scan_status'),
             'refresh_nonce' => wp_create_nonce('ogm_eqa_refresh_models'),
+            'default_instructions' => self::default_typo_instructions(),
         ]);
 
         wp_enqueue_style('ogm-eqa-admin-css', plugin_dir_url(__FILE__) . 'ogm-eqa-admin.css', ['dashicons'], OGM_EQA_VERSION);
@@ -1282,7 +1413,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<th scope="row"><label for="ogm-eqa-max-tokens">Max output tokens</label></th>';
         echo '<td>';
         echo '<input id="ogm-eqa-max-tokens" name="' . esc_attr(self::OPT_KEY) . '[max_output_tokens]" type="number" min="' . esc_attr(self::MIN_TOKENS) . '" max="' . esc_attr(self::MAX_TOKENS) . '" value="' . esc_attr((int)$s['max_output_tokens']) . '" />';
-        echo '<p class="description">Caps how long the AI&rsquo;s reply can be for a <strong>single</strong> scan — i.e. how many typos it can list for one post. It is <strong>not</strong> a daily or monthly budget. The default (350) holds dozens of findings; only raise it if very long posts get cut off.</p>';
+        echo '<p class="description">Caps how long the AI&rsquo;s reply can be for a <strong>single</strong> scan — i.e. how many typos it can list for one post. It is <strong>not</strong> a daily or monthly budget. Roughly 25&ndash;30 tokens per finding; reasoning models also spend some of this budget on hidden reasoning. If a scan reports hitting this limit, raise it (1000 is a comfortable default).</p>';
         echo '</td>';
         echo '</tr>';
 
@@ -1298,6 +1429,21 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         echo '<th scope="row">Behavior</th>';
         echo '<td>';
         echo '<label style="display:block;margin:2px 0;"><input type="checkbox" name="' . esc_attr(self::OPT_KEY) . '[strip_html]" value="1" ' . checked(1, (int)$s['strip_html'], false) . ' /> Strip HTML before scanning</label>';
+        echo '</td>';
+        echo '</tr>';
+
+        // Scan instructions (the system prompt sent with every scan).
+        $custom_ci    = trim((string)($s['custom_instructions'] ?? ''));
+        $effective_ci = $custom_ci !== '' ? $custom_ci : self::default_typo_instructions();
+        echo '<tr>';
+        echo '<th scope="row"><label for="ogm-eqa-instructions">Scan instructions</label></th>';
+        echo '<td>';
+        echo '<textarea id="ogm-eqa-instructions" name="' . esc_attr(self::OPT_KEY) . '[custom_instructions]" rows="12" class="large-text code ogm-eqa-instructions">' . esc_textarea($effective_ci) . '</textarea>';
+        echo '<p style="margin:6px 0 0;">';
+        echo '<button type="button" class="button ogm-eqa-reset-instructions">Reset to default</button> ';
+        echo '<span class="ogm-eqa-instructions-state">' . ($custom_ci !== '' ? '<span class="ogm-eqa-badge ogm-eqa-badge-bad" title="Customized">customized</span>' : '<span class="ogm-eqa-badge ogm-eqa-badge-good" title="Using the built-in default">default</span>') . '</span>';
+        echo '</p>';
+        echo '<p class="description">This is the exact prompt sent to the AI along with each post&rsquo;s text. Edit it to tune what gets flagged (e.g. add site-specific spellings to ignore). While it matches the default, plugin updates keep improving it automatically; once customized, your version is used verbatim. The JSON output format is enforced separately, so you can&rsquo;t break the report by editing this.</p>';
         echo '</td>';
         echo '</tr>';
 
@@ -1477,7 +1623,9 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $report = (string)get_post_meta($post_id, self::META_REPORT, true);
         if ($report === '') return '';
 
-        if (stripos($report, 'No obvious typos detected.') !== false) {
+        // Exact match only — a finding merely CONTAINING this phrase must not
+        // clean-render the report.
+        if (preg_match('/^no obvious typos detected\.?$/i', trim($report))) {
             return '<div class="ogm-eqa-report">' . esc_html($report) . '</div>';
         }
 
