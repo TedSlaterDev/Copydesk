@@ -1,8 +1,8 @@
 <?php
  /**
- * Plugin Name:       Editorial QA (AI Typos)
- * Description:       Scans scheduled posts for obvious typos via OpenAI or Anthropic; shows reports in an admin panel + post meta box + Posts list column.
- * Version:           1.12.0
+ * Plugin Name:       Copydesk (AI Editorial QA)
+ * Description:       Your AI copy desk — scans posts for objective typos (OpenAI or Anthropic) on the statuses you choose; reports in an admin panel + post meta box + Posts list column.
+ * Version:           1.15.1
  * Requires PHP:      8.0
  * Requires at least: 6.0
  * Author:            Orchard Grove Media, LLC
@@ -10,12 +10,12 @@
  * Author URI:        https://orchardgrove.com/
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
- * Text Domain:       editorial-qa
+ * Text Domain:       copydesk
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('OGM_EQA_VERSION', '1.12.0');
+define('OGM_EQA_VERSION', '1.15.1');
 
 class OGM_Editorial_QA {
     const OPT_KEY    = 'ogm_eqa_settings';
@@ -44,6 +44,7 @@ class OGM_Editorial_QA {
     const META_HASH            = '_ogm_eqa_scanned_hash';
     const META_MODEL           = '_ogm_eqa_model';
     const META_ERROR           = '_ogm_eqa_error';
+    const META_ERROR_GMT       = '_ogm_eqa_error_gmt'; // when the error happened (≠ last successful scan)
     const META_COST            = '_ogm_eqa_cost_micros'; // last scan cost, USD * 1e6 ('' if unpriced)
 
     const CRON_HOOK = 'ogm_eqa_scan_post';
@@ -64,6 +65,10 @@ class OGM_Editorial_QA {
 
         // Poll for a post's scan result (Live Rescan — no AI cost, reads the DB).
         add_action('wp_ajax_ogm_eqa_scan_status', [__CLASS__, 'ajax_scan_status']);
+
+        // Dismiss stale error alerts (per-post, and all-at-once from Reports).
+        add_action('wp_ajax_ogm_eqa_clear_error', [__CLASS__, 'ajax_clear_error']);
+        add_action('wp_ajax_ogm_eqa_clear_all_errors', [__CLASS__, 'ajax_clear_all_errors']);
 
         // "Refresh models" button on the Settings page (AJAX — updates in place).
         add_action('wp_ajax_ogm_eqa_refresh_models', [__CLASS__, 'ajax_refresh_models']);
@@ -227,7 +232,7 @@ class OGM_Editorial_QA {
 
         if ($api_key === '') {
             $const = $provider === 'anthropic' ? 'OGM_EQA_ANTHROPIC_API_KEY' : 'OGM_EQA_OPENAI_API_KEY';
-            self::store_error($post_id, sprintf('Missing %s API key. Configure it in Editorial QA → Settings, or define %s in wp-config.php.', ucfirst($provider), $const));
+            self::store_error($post_id, sprintf('Missing %s API key. Configure it in Copydesk → Settings, or define %s in wp-config.php.', ucfirst($provider), $const));
             return;
         }
 
@@ -238,7 +243,7 @@ class OGM_Editorial_QA {
         // badges/report don't keep describing content we can no longer verify
         // (otherwise a prior scan's result/error would linger forever).
         if ((string)$post->post_password !== '') {
-            foreach ([self::META_REPORT, self::META_ISSUE_COUNT, self::META_ERROR, self::META_HASH, self::META_LAST_SCANNED_GM, self::META_MODEL] as $mk) {
+            foreach ([self::META_REPORT, self::META_ISSUE_COUNT, self::META_ERROR, self::META_ERROR_GMT, self::META_HASH, self::META_LAST_SCANNED_GM, self::META_MODEL] as $mk) {
                 delete_post_meta($post_id, $mk);
             }
             return;
@@ -255,11 +260,12 @@ class OGM_Editorial_QA {
         }
 
         delete_post_meta($post_id, self::META_ERROR);
+        delete_post_meta($post_id, self::META_ERROR_GMT);
 
         // Optional monthly budget guardrail — stop before spending past the cap.
         $budget = (float)($s['monthly_budget_usd'] ?? 0);
         if ($budget > 0 && self::month_spend_micros() >= (int) round($budget * 1000000)) {
-            self::store_error($post_id, sprintf('Monthly scan budget of $%s reached — this scan was skipped. Raise it in Editorial QA → Settings.', number_format($budget, 2)));
+            self::store_error($post_id, sprintf('Monthly scan budget of $%s reached — this scan was skipped. Raise it in Copydesk → Settings.', number_format($budget, 2)));
             return;
         }
 
@@ -312,13 +318,16 @@ class OGM_Editorial_QA {
 
     private static function store_error($post_id, $message) {
         update_post_meta($post_id, self::META_ERROR, sanitize_text_field((string)$message));
-        update_post_meta($post_id, self::META_LAST_SCANNED_GM, gmdate('Y-m-d H:i:s'));
+        // The failure gets its OWN timestamp — META_LAST_SCANNED_GM always
+        // means "last SUCCESSFUL scan", so dismissing an alert can never
+        // present a failure time as a successful verification.
+        update_post_meta($post_id, self::META_ERROR_GMT, gmdate('Y-m-d H:i:s'));
     }
 
     /** Log verbose diagnostics to the PHP error log only when WP_DEBUG is on. */
     private static function debug_log($detail) {
         if (defined('WP_DEBUG') && WP_DEBUG) {
-            error_log('Editorial QA: ' . (string)$detail);
+            error_log('Copydesk: ' . (string)$detail);
         }
     }
 
@@ -700,7 +709,7 @@ $body = [
     if (($json['status'] ?? '') === 'incomplete') {
         $reason = (string)($json['incomplete_details']['reason'] ?? 'unknown');
         if ($reason === 'max_output_tokens') {
-            return new WP_Error('ogm_eqa_truncated', 'The scan hit the Max output tokens limit before the report finished (reasoning models spend this budget on hidden reasoning too). Raise "Max output tokens" in Editorial QA → Settings → Advanced.', $usage_data);
+            return new WP_Error('ogm_eqa_truncated', 'The scan hit the Max output tokens limit before the report finished (reasoning models spend this budget on hidden reasoning too). Raise "Max output tokens" in Copydesk → Settings → Advanced.', $usage_data);
         }
         return new WP_Error('ogm_eqa_incomplete', 'OpenAI returned an incomplete response (' . sanitize_text_field($reason) . ').', $usage_data);
     }
@@ -918,7 +927,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
     // Truncation: HTTP 200 but the token cap cut the JSON mid-stream (models
     // with extended thinking spend this budget on thinking too).
     if (($json['stop_reason'] ?? '') === 'max_tokens') {
-        return new WP_Error('ogm_eqa_truncated', 'The scan hit the Max output tokens limit before the report finished (models with extended thinking spend this budget on thinking too). Raise "Max output tokens" in Editorial QA → Settings → Advanced.', $usage_data);
+        return new WP_Error('ogm_eqa_truncated', 'The scan hit the Max output tokens limit before the report finished (models with extended thinking spend this budget on thinking too). Raise "Max output tokens" in Copydesk → Settings → Advanced.', $usage_data);
     }
 
     // Structured output arrives as the first text content block (JSON string).
@@ -1025,10 +1034,10 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         $cap = 'edit_others_posts';
 
         add_menu_page(
-            'Editorial QA',
-            'Editorial QA',
+            'Copydesk',
+            'Copydesk',
             $cap,
-            'ogm-editorial-qa',
+            'ogm-editorial-qa', // slug unchanged on purpose — bookmarks/upgrades keep working
             [__CLASS__, 'render_admin_page'],
             'dashicons-editor-spellcheck',
             60
@@ -1144,6 +1153,8 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             'nonce'         => wp_create_nonce('ogm_eqa_rescan'),
             'status_nonce'  => wp_create_nonce('ogm_eqa_scan_status'),
             'refresh_nonce' => wp_create_nonce('ogm_eqa_refresh_models'),
+            'clear_nonce'     => wp_create_nonce('ogm_eqa_clear_error'),
+            'clear_all_nonce' => wp_create_nonce('ogm_eqa_clear_all_errors'),
             'default_instructions' => self::default_typo_instructions(),
         ]);
 
@@ -1162,17 +1173,18 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
         echo '<div class="ogm-eqa-header">';
         echo '<div class="ogm-eqa-brand">';
-        echo '<span class="ogm-eqa-mark" aria-hidden="true"><span class="dashicons dashicons-editor-spellcheck"></span></span>';
+        // The Copydesk mark — same art as copydesk.dev (gradient id namespaced to avoid clashes).
+        echo '<span class="ogm-eqa-mark" aria-hidden="true"><svg viewBox="0 0 70 70" width="46" height="46" focusable="false"><defs><linearGradient id="ogm-eqa-mk-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8c3e"/><stop offset="1" stop-color="#27451c"/></linearGradient></defs><rect width="60" height="60" rx="14" fill="url(#ogm-eqa-mk-g)"/><rect x="12" y="9" width="36" height="43" rx="4" fill="#fff"/><rect x="17" y="16" width="26" height="3.4" rx="1.7" fill="#c9d8bc"/><rect x="17" y="23" width="26" height="3.4" rx="1.7" fill="#c9d8bc"/><rect x="17" y="30" width="17" height="3.4" rx="1.7" fill="#c9d8bc"/><path d="M17 41 q2.5 -3.4 5 0 t5 0 t5 0" fill="none" stroke="#5b8c3e" stroke-width="2.4" stroke-linecap="round"/><circle cx="53" cy="53" r="14" fill="#fff"/><circle cx="53" cy="53" r="12.5" fill="#eef3e7"/><path d="M47.5 53.5 l4 4 l7.5 -8.5" fill="none" stroke="#27451c" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
         echo '<div class="ogm-eqa-brand-text">';
-        echo '<h1>Editorial QA</h1>';
-        echo '<p class="ogm-eqa-tagline">AI typo checks for scheduled posts — by Orchard Grove Media</p>';
+        echo '<h1>Copydesk</h1>';
+        echo '<p class="ogm-eqa-tagline">The AI copy desk for WordPress — by Orchard Grove Media</p>';
         echo '</div>';
         echo '</div>';
         echo '<span class="ogm-eqa-version">v' . esc_html(OGM_EQA_VERSION) . '</span>';
         echo '</div>';
         echo '<hr class="wp-header-end" />';
 
-        echo '<nav class="ogm-eqa-tabs" aria-label="Editorial QA">';
+        echo '<nav class="ogm-eqa-tabs" aria-label="Copydesk">';
         foreach ($tabs as $slug => $t) {
             $url    = add_query_arg(['page' => $slug], admin_url('admin.php'));
             $active = ($slug === $current);
@@ -1195,6 +1207,21 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         self::render_admin_header('ogm-editorial-qa');
 
         echo '<p class="ogm-eqa-intro">Posts are scanned for obvious typos when scheduled. Use <strong>Rescan</strong> after edits, or to check drafts and published posts on demand.</p>';
+
+        // Offer a one-click cleanup when stored error alerts exist (e.g. a
+        // provider-credits outage stamps an error on every post it touched).
+        global $wpdb;
+        $err_count = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = %s",
+            self::META_ERROR
+        ));
+        if ($err_count > 0) {
+            echo '<div class="ogm-eqa-inline-notice">';
+            echo esc_html(sprintf('%d post%s ha%s a stored error alert (often left over after a fixed outage, e.g. exhausted API credits).', $err_count, $err_count === 1 ? '' : 's', $err_count === 1 ? 's' : 've'));
+            echo ' <button type="button" class="button ogm-eqa-clear-all-errors">Clear all error alerts</button>';
+            echo ' <span class="ogm-eqa-clear-all-status" aria-live="polite"></span>';
+            echo '</div>';
+        }
 
         echo '<div class="ogm-eqa-card">';
         $table->views();
@@ -1380,7 +1407,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             echo esc_html($obj->labels->name);
             echo '</label>';
         }
-        echo '<p class="description">Which content types Editorial QA watches and decorates.</p>';
+        echo '<p class="description">Which content types Copydesk watches and decorates.</p>';
         echo '</td>';
         echo '</tr>';
 
@@ -1567,7 +1594,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         foreach ($post_types as $pt) {
             add_meta_box(
                 'ogm-eqa-metabox',
-                'Editorial QA (Typos)',
+                'Copydesk (AI Typos)',
                 [__CLASS__, 'render_meta_box'],
                 $pt,
                 'side',
@@ -1605,7 +1632,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         if ($model) {
             echo '<p class="description" style="display:none;">Model: <code>'.esc_html($model).'</code></p>';
         }
-        echo '<p class="ogm-eqa-errline" style="color:#b32d2e;' . ($err ? '' : 'display:none;') . '"><strong>Error:</strong> <span class="ogm-eqa-err-val">' . esc_html($err) . '</span></p>';
+        echo '<p class="ogm-eqa-errline" style="color:#b32d2e;' . ($err ? '' : 'display:none;') . '"><strong>Error:</strong> <span class="ogm-eqa-err-val">' . esc_html($err) . '</span> <button type="button" class="button-link ogm-eqa-clear-error" data-post-id="' . esc_attr($post->ID) . '" data-context="metabox">Dismiss</button></p>';
 
         // Hide the (possibly stale) report while an error is showing.
         echo '<div class="ogm-eqa-report-wrap">' . ($err !== '' ? '' : self::render_report_html($post->ID)) . '</div>';
@@ -1693,7 +1720,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
 
         if ($err) {
             echo '<span class="ogm-eqa-badge ogm-eqa-badge-bad" title="'.esc_attr($err).'">!</span>';
-            echo '<div style="margin-top:6px;"><button type="button" class="button button-small ogm-eqa-rescan" data-post-id="'.esc_attr($post_id).'" data-context="postslist" data-scanned="'.esc_attr($last).'">Rescan</button></div>';
+            echo '<div style="margin-top:6px;"><button type="button" class="button button-small ogm-eqa-rescan" data-post-id="'.esc_attr($post_id).'" data-context="postslist" data-scanned="'.esc_attr($last).'">Rescan</button> <button type="button" class="button-link ogm-eqa-clear-error" data-post-id="'.esc_attr($post_id).'" data-context="postslist">Dismiss</button></div>';
             echo '<div class="ogm-eqa-rescan-status" style="margin-top:6px;"></div>';
             return;
         }
@@ -1778,6 +1805,87 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
         }
 
         wp_send_json_success(self::scan_status_payload($post_id));
+    }
+
+    /**
+     * Remove a post's stored error alert (and its error timestamp). Legacy
+     * cleanup: versions < 1.13.0 stamped META_LAST_SCANNED_GM at failure time,
+     * so a never-successfully-scanned post can carry a timestamp without a
+     * report — clear that too, returning the state honestly to "Not scanned"
+     * rather than a false green "Clean".
+     */
+    private static function clear_error_meta($post_id) {
+        delete_post_meta($post_id, self::META_ERROR);
+        delete_post_meta($post_id, self::META_ERROR_GMT);
+        if ((string)get_post_meta($post_id, self::META_REPORT, true) === '') {
+            delete_post_meta($post_id, self::META_LAST_SCANNED_GM);
+        }
+    }
+
+    /**
+     * AJAX: dismiss one post's error alert (no AI call; metadata only).
+     * Per-post action, so per-post rights are the gate — an Author may dismiss
+     * an alert on their own post (the button only renders where they can edit).
+     */
+    public static function ajax_clear_error() {
+        check_ajax_referer('ogm_eqa_clear_error', 'nonce');
+
+        $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
+        if (!$post_id || !get_post($post_id)) {
+            wp_send_json_error(['message' => 'Post not found.'], 404);
+        }
+        if (!current_user_can('edit_post', $post_id)) {
+            wp_send_json_error(['message' => 'Not allowed.'], 403);
+        }
+
+        self::clear_error_meta($post_id);
+
+        wp_send_json_success(self::scan_status_payload($post_id));
+    }
+
+    /**
+     * AJAX: dismiss error alerts in bulk (e.g. after a credits outage).
+     * Processes a bounded batch per request — the JS repeats while `remaining`
+     * is > 0 — so a huge backlog can't blow past max_execution_time. Only
+     * posts the current user can edit are touched (mirrors the per-post gate).
+     */
+    public static function ajax_clear_all_errors() {
+        if (!current_user_can('edit_others_posts')) {
+            wp_send_json_error(['message' => 'Insufficient permissions.'], 403);
+        }
+        check_ajax_referer('ogm_eqa_clear_all_errors', 'nonce');
+
+        @set_time_limit(60);
+        global $wpdb;
+        $batch = 500;
+        $ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s LIMIT %d",
+            self::META_ERROR,
+            $batch
+        ));
+
+        $cleared = 0;
+        $skipped = 0;
+        foreach ((array)$ids as $pid) {
+            if (!current_user_can('edit_post', (int)$pid)) { $skipped++; continue; }
+            self::clear_error_meta((int)$pid);
+            $cleared++;
+        }
+
+        // How many alerts remain that this user could still clear next round.
+        $remaining = 0;
+        if (count($ids) === $batch || $skipped > 0) {
+            $left = $wpdb->get_col($wpdb->prepare(
+                "SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s LIMIT %d",
+                self::META_ERROR,
+                $batch
+            ));
+            foreach ((array)$left as $pid) {
+                if (current_user_can('edit_post', (int)$pid)) { $remaining++; }
+            }
+        }
+
+        wp_send_json_success(['cleared' => $cleared, 'skipped' => $skipped, 'remaining' => $remaining]);
     }
 
     /** The post's current scan state as a plain array (shared by rescan + poll). */
@@ -1881,7 +1989,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
             $all[$provider] = ['ids' => $models, 'updated' => time()];
             update_option(self::OPT_MODELS, $all);
         } catch (\Throwable $e) {
-            error_log("Editorial QA model refresh failed ($provider): " . $e->getMessage());
+            error_log("Copydesk model refresh failed ($provider): " . $e->getMessage());
             wp_send_json_error(['message' => mb_substr(trim(wp_strip_all_tags($e->getMessage())), 0, 200)]);
         }
 
@@ -2081,7 +2189,7 @@ private static function call_anthropic_for_typos($text, $api_key, $model, $max_o
     }
 }
 
-/** --------- List Table (Editorial QA page) --------- */
+/** --------- List Table (Copydesk Reports page) --------- */
 if (is_admin() && !class_exists('WP_List_Table')) {
     require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
 }
@@ -2097,9 +2205,9 @@ if (is_admin()) {
                 'ajax'     => false,
             ]);
 
-            $this->status = isset($_GET['eqa_status']) ? sanitize_key((string)$_GET['eqa_status']) : 'future';
-            if (!in_array($this->status, ['future','draft','pending','publish','any'], true)) {
-                $this->status = 'future';
+            $this->status = isset($_GET['eqa_status']) ? sanitize_key((string)$_GET['eqa_status']) : 'any';
+            if (!in_array($this->status, ['any','future','pending','draft','publish'], true)) {
+                $this->status = 'any';
             }
         }
 
@@ -2107,11 +2215,11 @@ if (is_admin()) {
             $base = admin_url('admin.php?page=ogm-editorial-qa');
             $views = [];
             $statuses = [
-                'future'  => 'Scheduled',
-                'draft'   => 'Drafts',
-                'pending' => 'Pending',
-                'publish' => 'Published',
                 'any'     => 'All',
+                'future'  => 'Scheduled',
+                'pending' => 'Pending',
+                'draft'   => 'Drafts',
+                'publish' => 'Published',
             ];
             foreach ($statuses as $k => $label) {
                 $url = add_query_arg(['eqa_status' => $k], $base);
@@ -2139,7 +2247,10 @@ if (is_admin()) {
 
             $args = [
                 'post_type'      => 'any',
-                'post_status'    => $this->status === 'any' ? ['future','draft','pending','publish'] : [$this->status],
+                // "All" includes every non-internal status, so posts scanned in
+                // Private or custom workflow statuses (both scannable via the
+                // trigger settings) aren't invisible here.
+                'post_status'    => $this->status === 'any' ? array_keys(get_post_stati(['internal' => false])) : [$this->status],
                 'posts_per_page' => $per_page,
                 'paged'          => $paged,
                 's'              => $search,

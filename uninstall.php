@@ -23,6 +23,7 @@ $ogm_eqa_meta_keys = [
     '_ogm_eqa_scanned_hash',
     '_ogm_eqa_model',
     '_ogm_eqa_error',
+    '_ogm_eqa_error_gmt',
     '_ogm_eqa_cost_micros',
     '_ogm_eqa_last_trigger_user_id',
 ];

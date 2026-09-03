@@ -1,12 +1,12 @@
-# Editorial QA (AI Typos) — Technical Specification
+# Copydesk — Technical Specification
 
-**Plugin:** Editorial QA (AI Typos)
+**Plugin:** Copydesk (formerly Editorial QA / AI Typos — display rename in 1.14.0; **1.15.0 renamed the folder + main file to `copydesk/copydesk.php`** and the Text Domain to `copydesk`. All internal slugs, options, meta keys, admin page slugs (`ogm-editorial-qa*`), and the costs table intentionally keep the `editorial-qa` / `ogm_eqa` identifiers. Because the folder changed, 1.15.0 does NOT upgrade a ≤1.14.x install in place — the old plugin must be deleted first, and its uninstall wipes its data.)
 **Author:** Orchard Grove Media, LLC
-**Version of record:** 1.12.0
+**Version of record:** 1.15.0
 **Requires:** WordPress 6.0+, PHP 8.0+
 **Providers:** OpenAI (Responses API) or Anthropic (Messages API) — selectable per site
 
-This document is the specification of record for the plugin's current behavior. It reflects the shipping code in `editorial-qa.php`, `ogm-eqa-admin.js`, and `ogm-eqa-admin.css`.
+This document is the specification of record for the plugin's current behavior. It reflects the shipping code in `copydesk.php`, `ogm-eqa-admin.js`, and `ogm-eqa-admin.css`.
 
 ---
 
@@ -34,7 +34,7 @@ Editorial QA detects **objective, technical typos** in WordPress posts and surfa
 
 ## 2. High-level architecture
 
-Single-file plugin (`editorial-qa.php`) implemented as a static class `OGM_Editorial_QA`, plus an admin-only `OGM_EQA_List_Table` (extends `WP_List_Table`) and two admin assets.
+Single-file plugin (`copydesk.php`) implemented as a static class `OGM_Editorial_QA`, plus an admin-only `OGM_EQA_List_Table` (extends `WP_List_Table`) and two admin assets.
 
 ```
 schedule / re-save post ──► transition_post_status hook
@@ -266,6 +266,10 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 - AJAX action: `ogm_eqa_rescan` (nonce `ogm_eqa_rescan`).
 - AJAX action: `ogm_eqa_refresh_models` → `ajax_refresh_models()` (nonce `ogm_eqa_refresh_models`, cap `manage_options`). Returns JSON; the dropdown updates client-side.
 - AJAX action: `ogm_eqa_scan_status` → `ajax_scan_status()` (nonce `ogm_eqa_scan_status`, cap `edit_others_posts` + per-post `edit_post`). Read-only poll for Live Rescan — returns the post's stored scan state as JSON; **no provider call**.
+- AJAX action: `ogm_eqa_clear_error` → `ajax_clear_error()` (nonce `ogm_eqa_clear_error`, per-post `edit_post` — no broad cap, so an Author can dismiss on their own post, matching where the button renders). **Dismisses a stale error alert** (1.13.0): `clear_error_meta()` deletes `_ogm_eqa_error` + `_ogm_eqa_error_gmt`, and — when the post has no stored report — also `_ogm_eqa_last_scanned_gmt` (legacy pre-1.13 rows stamped the scan time at failure), so a never-successfully-scanned post returns to "Not scanned" instead of a false "Clean". Returns `scan_status_payload()`; the JS re-renders in place via `eqaApplyResult()`, which also re-shows/re-enables the Dismiss control on every new `error` status and hides it otherwise. Metadata only — no provider call.
+- AJAX action: `ogm_eqa_clear_all_errors` → `ajax_clear_all_errors()` (nonce `ogm_eqa_clear_all_errors`, cap `edit_others_posts` **plus a per-post `edit_post` filter** — posts the caller can't edit are skipped and counted). Bulk outage cleanup, **batched** (500/request with `set_time_limit(60)`; returns `cleared`/`skipped`/`remaining` and the JS repeats until `remaining` is 0). Offered on the Reports page in an amber inline notice whenever stored error alerts exist.
+
+**Error timestamps (1.13.0):** `store_error()` writes the failure time to its own key `_ogm_eqa_error_gmt` and **no longer touches** `_ogm_eqa_last_scanned_gmt` — that key now always means "last **successful** scan" everywhere (meta box "Last scan", Reports column, `scan_status_payload`). This is what makes Dismiss honest: a restored report shows under the time it was actually produced, never under a failure's time.
 - Cost ledger table: `{$wpdb->prefix}ogm_eqa_costs` (created via `dbDelta` in `maybe_upgrade()`, gated by option `ogm_eqa_db_version` = `DB_VERSION`; also on `register_activation_hook`). Columns: `id, created_gmt, provider, model, post_id, input_tokens, output_tokens, cost_micros` (`cost_micros` NULL when the model is unpriced).
 
 ---
@@ -284,7 +288,7 @@ currently-saved value. The cache is **per-provider**, in a separate option:
 
 Both admin screens share a branded header (`render_admin_header()`): an icon "mark", title + tagline, version pill, and a two-tab nav (**Reports** / **Settings**), styled with the Orchard Grove Media design system in `ogm-eqa-admin.css` (white rounded cards, green accent `#5b8c3e`, green focus rings). The CSS declares `dashicons` as a dependency.
 
-1. **Editorial QA page** (`admin.php?page=ogm-editorial-qa`, cap `edit_others_posts`) — branded header + an intro line + a card wrapping the `OGM_EQA_List_Table` (status views Scheduled / Drafts / Pending / Published / All via `eqa_status`, search, 20/page pagination, columns Title / Status / Date / Issues / Last scan / Actions). Scheduled view sorts ascending by date; others descending.
+1. **Editorial QA page** (`admin.php?page=ogm-editorial-qa`, cap `edit_others_posts`) — branded header + an intro line + a card wrapping the `OGM_EQA_List_Table` (status views **All (default) / Scheduled / Pending / Drafts / Published** via `eqa_status`; "All" spans every non-internal registered status incl. Private + custom workflow statuses; search, 20/page pagination, columns Title / Status / Date / Issues / Last scan / Actions). Scheduled view sorts ascending by date; others descending.
 2. **Settings** (`page=ogm-editorial-qa-settings`, cap `manage_options`) — a main-column + sidebar layout. The **main column** holds the form, grouped into three **panels** (each a `.ogm-eqa-card` with an `.ogm-eqa-card-title`): **AI provider** (provider selector + per-provider `render_provider_section()` = API key + model dropdown + **Refresh models** button), **When to scan** (post types + the **Scan triggers** checkboxes, one per non-internal registered status from `get_post_stati`, + the `rescan_on_update` toggle), and **Advanced** (max output tokens + the strip-HTML Behavior toggle). The **sidebar** (`render_settings_sidebar()`) shows an at-a-glance card (active provider / model / key-configured dot / auto-scan = count of trigger statuses) and a links card. **Only the selected provider's key + model rows are shown** — `render_provider_section()` tags each provider's two rows with `class="ogm-eqa-provider-row" data-provider="…"` and hides the non-active provider's rows server-side (`display:none`, so it works without JS); a `change` handler on the provider dropdown (`eqaSyncProvider()`) toggles them live. Hidden rows still submit, so the other provider's saved key/model are preserved. A per-section note appears when that provider's key is supplied by its wp-config constant. Each provider's API-key field carries a **"Create a key"** link to the provider's console (`platform.openai.com/api-keys` / `console.anthropic.com/settings/keys`). Each **Refresh models** button is a `type="button"` that fires an **AJAX** call (`ogm_eqa_refresh_models`) to `ajax_refresh_models()`, which fetches that provider's `/v1/models` (`fetch_openai_models` / `fetch_anthropic_models`), ranks/dedupes/caps the result (≤12), caches it under `ogm_eqa_models[<provider>]`, and returns JSON. The JS rebuilds the model `<select>` in place (preserving the current selection if still offered) and shows the result — or the **exact error** (missing key, HTTP status, transport) — inline next to the button; there is no page reload and no blank admin-post page. Because the button is not a submit control, pressing Enter in a field saves settings rather than triggering a refresh. The fetch uses the resolved key (settings or wp-config constant), so the key must be **saved** first.
 3. **Meta box** "Editorial QA (Typos)" — registered on each enabled post type, side/high. Shows Clean/Issues badge, last-scan time (site tz), error (if any), the numbered list, and a Rescan button.
 4. **Posts list "Issues" column** (on the native `edit.php`) — inserted after Title for each enabled post type, sortable by `_ogm_eqa_issue_count`. Shows a numeric/`!`/`—` badge and an inline Rescan button. Being a registered list-table column, WordPress automatically lists it in **Screen Options** so it can be shown/hidden per user.
@@ -333,7 +337,7 @@ Tracked items not addressed in 1.5.0:
 
 | File | Role |
 |---|---|
-| `editorial-qa.php` | All plugin logic (class, list table, hooks, OpenAI + Anthropic clients) |
+| `copydesk.php` | All plugin logic (class, list table, hooks, OpenAI + Anthropic clients) |
 | `uninstall.php` | Deletes options + post meta when the plugin is deleted |
 | `ogm-eqa-admin.js` | Rescan button → AJAX wiring |
 | `ogm-eqa-admin.css` | OGM design system: header/tabs/cards/sidebar, badges, meta-box list |

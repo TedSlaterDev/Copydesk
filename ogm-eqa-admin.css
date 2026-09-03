@@ -53,15 +53,11 @@
 	justify-content: center;
 	width: 46px;
 	height: 46px;
-	border-radius: 12px;
-	background: #eef4e8;
-	border: 1px solid #d7e6cc;
-	color: #4b7a3f;
 }
-.ogm-eqa-mark .dashicons {
-	font-size: 26px;
-	width: 26px;
-	height: 26px;
+.ogm-eqa-mark svg {
+	display: block;
+	width: 100%;
+	height: 100%;
 }
 .ogm-eqa-brand-text h1 {
 	margin: 0;
@@ -303,6 +299,29 @@ ol.ogm-eqa-list li::marker {
 ol.ogm-eqa-list span { color: #777; }
 .ogm-eqa-report { color: #146c2e; font-weight: 600; }
 .ogm-eqa-rescan-status { color: #646970; font-style: italic; }
+
+/* Amber inline notice (OGM house style) — e.g. the stale-error-alerts cleanup */
+.ogm-eqa-inline-notice {
+	margin: 0 0 1rem;
+	padding: .7rem .9rem;
+	font-size: .9rem;
+	color: #5b4d10;
+	background: #fcf9e8;
+	border: 1px solid #f0e6a6;
+	border-left: 4px solid #dba617;
+	border-radius: 6px;
+}
+.ogm-eqa-inline-notice .button { margin-left: .4rem; }
+.ogm-eqa-clear-all-status { margin-left: .4rem; font-style: italic; color: #50575e; }
+
+/* "Dismiss" link on error alerts (meta box + Posts column) */
+.ogm-eqa-clear-error {
+	color: #b32d2e;
+	text-decoration: underline;
+	margin-left: .25rem;
+}
+.ogm-eqa-clear-error:hover,
+.ogm-eqa-clear-error:focus { color: #8e1f19; }
 
 /* Settings: "Refresh models" inline status */
 .ogm-eqa-refresh-status { margin-left: .4rem; color: #50575e; font-style: italic; font-size: .9rem; }

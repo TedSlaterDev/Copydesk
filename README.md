@@ -1,19 +1,19 @@
-# Editorial QA (AI Typos)
+# Copydesk (formerly Editorial QA)
 
 **Contributors:** Orchard Grove Media, LLC
-**Tags:** editorial, proofreading, typos, openai, anthropic, claude, ai, qa
+**Tags:** copydesk, editorial, proofreading, typos, openai, anthropic, claude, ai, qa
 **Requires at least:** 6.0
 **Tested up to:** 6.5
 **Requires PHP:** 8.0
-**Stable tag:** 1.12.0
+**Stable tag:** 1.15.1
 **License:** GPL-2.0-or-later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
-Automatically scans posts for obvious, objective typos using OpenAI or Anthropic (Claude) and surfaces the results inside wp-admin — no copy/paste into a chatbot required.
+**Your AI copy desk for WordPress.** Copydesk automatically scans posts for obvious, objective typos using OpenAI or Anthropic (Claude) and surfaces the results inside wp-admin — no copy/paste into a chatbot required.
 
 ## Description
 
-Editorial QA is a lightweight proofreading assistant for WordPress. When a post is **scheduled** (and, optionally, each time a scheduled post is re-saved), the plugin sends the title and body to your chosen AI provider — **OpenAI** or **Anthropic (Claude)** — and asks for a tightly-scoped list of *objective* technical typos. Results appear as a badge and a numbered list in three places: a dedicated admin page, the post editor's side meta box, and a sortable "QA" column on the Posts list.
+Copydesk is a lightweight proofreading assistant for WordPress. When a post is **scheduled** (and, optionally, each time a scheduled post is re-saved), the plugin sends the title and body to your chosen AI provider — **OpenAI** or **Anthropic (Claude)** — and asks for a tightly-scoped list of *objective* technical typos. Results appear as a badge and a numbered list in three places: a dedicated admin page, the post editor's side meta box, and a sortable "Issues" column on the Posts list.
 
 It is intentionally conservative. It flags **only**:
 
@@ -32,25 +32,25 @@ The model is constrained with a structured-output (JSON schema) contract — Ope
 
 ### Where results show up
 
-1. **Editorial QA admin page** — a filterable table (Scheduled / Drafts / Pending / Published / All) with issue counts, last-scan time, and per-row Rescan/View actions.
-2. **Post editor meta box** ("Editorial QA (Typos)") — a Clean/Issues badge, the numbered typo list, last-scan time, and a Rescan button.
-3. **Posts list "QA" column** — an at-a-glance badge per post, sortable by issue count, with an inline Rescan button.
+1. **Copydesk Reports page** — a filterable table (All / Scheduled / Pending / Drafts / Published) with issue counts, last-scan time, and per-row Rescan/View actions.
+2. **Post editor meta box** ("Copydesk (AI Typos)") — a Clean/Issues badge, the numbered typo list, last-scan time, and a Rescan button.
+3. **Posts list "Issues" column** — an at-a-glance badge per post, sortable by issue count, with an inline Rescan button.
 
 ### Bring your own key (BYOK)
 
-Editorial QA uses **your** OpenAI or Anthropic API key and bills to **your** account with that provider. Each scan is a single API request. Unchanged content is hashed and skipped, so re-saving a post that hasn't changed does not spend tokens.
+Copydesk uses **your** OpenAI or Anthropic API key and bills to **your** account with that provider. Each scan is a single API request. Unchanged content is hashed and skipped, so re-saving a post that hasn't changed does not spend tokens.
 
 ## Installation
 
-1. Upload the `editorial-qa` folder to `/wp-content/plugins/`, or install the ZIP via **Plugins → Add New → Upload**.
-2. Activate **Editorial QA (AI Typos)**.
-3. Go to **Editorial QA → Settings**, choose your **AI provider** (OpenAI or Anthropic), provide that provider's API key (see below), choose a model, and select which post types to scan.
+1. Upload the `copydesk` folder to `/wp-content/plugins/`, or install the ZIP via **Plugins → Add New → Upload**.
+2. Activate **Copydesk (AI Editorial QA)**.
+3. Go to **Copydesk → Settings**, choose your **AI provider** (OpenAI or Anthropic), provide that provider's API key (see below), choose a model, and select which post types to scan.
 
 ### Providing the API key
 
 Each provider has its own key field and its own optional wp-config constant. You only need to configure the provider you select.
 
-- **Settings field** — paste the key into the matching field on **Editorial QA → Settings**. It is stored in `wp_options`.
+- **Settings field** — paste the key into the matching field on **Copydesk → Settings**. It is stored in `wp_options`.
 - **wp-config.php constant (recommended)** — keep the secret out of the database:
 
   ```php
@@ -78,7 +78,7 @@ It caps how long the AI's reply can be for a **single** scan — i.e. how many t
 
 ### Does it change my content?
 
-No. Editorial QA never edits your posts. It only reports suspected typos for a human to act on.
+No. Copydesk never edits your posts. It only reports suspected typos for a human to act on.
 
 ### Why did it flag something that isn't a typo?
 
@@ -103,11 +103,29 @@ The post title and body (with shortcodes, blockquotes, and HTML removed) are sen
 
 ## Screenshots
 
-1. The Editorial QA admin page with status filters and per-post issue counts.
+1. The Copydesk Reports page with status filters and per-post issue counts.
 2. The post editor meta box showing a typo report.
-3. The sortable "QA" column on the Posts list.
+3. The sortable "Issues" column on the Posts list.
 
 ## Changelog
+
+### 1.15.1
+- The Copydesk logo — the same mark as on copydesk.dev — now appears in the admin header of the Reports, Costs, and Settings pages, replacing the generic spellcheck icon.
+
+### 1.15.0
+- **The plugin folder is now `copydesk/`** (main file `copydesk.php`; was `editorial-qa/editorial-qa.php`). WordPress treats the new folder as a different plugin, so there is no in-place upgrade from 1.14.x or earlier: **deactivate and delete the old plugin first, then install this ZIP fresh**. Deleting the old copy runs its uninstall cleanup, which erases its settings, reports, and cost history — re-enter your API key, model, and scan triggers after installing.
+- Admin page URLs are unchanged, so bookmarks to the Reports, Costs, and Settings pages keep working.
+- Text Domain updated to `copydesk`; documentation refreshed to the current labels (Copydesk menu, "Issues" column, current Reports view order). No functional changes.
+
+### 1.14.0
+- **Renamed to Copydesk.** New display name, menu label, and tagline ("The AI copy desk for WordPress"). Purely cosmetic: every slug, option, meta key, table, folder, and URL is unchanged, so upgrades, bookmarks, and saved settings all keep working.
+
+### 1.13.1
+- Reports page: **All** is now the first and default view (then Scheduled, Pending, Drafts, Published), and "All" now includes Private and custom workflow statuses so nothing scannable is invisible.
+
+### 1.13.0
+- **Dismissable error alerts.** Scan errors (e.g. "no credits remaining") are stored per-post and used to linger until the next scan. Each alert now has a **Dismiss** link in the post's Editorial QA panel and in the Posts-list column, and the Reports page offers **Clear all error alerts** for cleaning up after an outage in one click (batched, and only on posts you can edit). Dismissing is metadata-only — no AI call, and any previous successful report reappears under its true scan time.
+- "Last scan" now always means the last **successful** scan — failures keep their own timestamp instead of overwriting it.
 
 ### 1.12.0
 - **Truncation is now detected and explained.** When a scan hits the Max output tokens limit (both providers), you get an actionable message pointing at the setting instead of a cryptic "could not be parsed" error — and the tokens spent still land in the Costs ledger.

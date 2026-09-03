@@ -48,6 +48,12 @@ jQuery(function($){
     if($errln.length){
       if(d.status === 'error' && d.error){ $errln.find('.ogm-eqa-err-val').text(d.error); $errln.show(); } else { $errln.hide(); }
     }
+    // The Dismiss control must come back for every NEW error (a prior dismiss
+    // hides/disables it), and go away whenever there is no error to dismiss.
+    var $dismiss = $wrap.find('.ogm-eqa-clear-error');
+    if($dismiss.length){
+      if(d.status === 'error'){ $dismiss.show().prop('disabled', false); } else { $dismiss.hide(); }
+    }
 
     if(d.status === 'error')        { $status.text(d.error || 'Scan error.'); }
     else if(d.status === 'skipped') { $status.text('Skipped — password-protected posts aren’t scanned.'); }
@@ -173,6 +179,78 @@ jQuery(function($){
   }
   $(document).on('change', '#ogm-eqa-provider', eqaSyncProvider);
   eqaSyncProvider();
+
+  /* ---- Dismiss one post's stale error alert (metadata only — no AI call) ---- */
+  $(document).on('click', '.ogm-eqa-clear-error', function(e){
+    e.preventDefault();
+    var $clr = $(this);
+    var postId = $clr.data('post-id');
+    if(!postId) return;
+    var $wrap   = $clr.closest('td, .ogm-eqa-metabox');
+    var $status = $wrap.find('.ogm-eqa-rescan-status').first();
+    // Prefer the Rescan button as the state carrier (data-context/data-scanned).
+    var $btn = $wrap.find('.ogm-eqa-rescan').first();
+    if(!$btn.length) $btn = $clr;
+
+    $clr.prop('disabled', true);
+    $.post(OGM_EQA.ajax_url, {
+      action: 'ogm_eqa_clear_error',
+      nonce: OGM_EQA.clear_nonce,
+      post_id: postId
+    }).done(function(resp){
+      var d = (resp && resp.data) ? resp.data : null;
+      if(resp && resp.success && d){
+        eqaApplyResult($btn, $wrap, $status, d); // also hides/re-enables the Dismiss control by status
+        if(d.status === 'none'){ $status.text('Alert cleared.'); }
+        else if(d.status === 'skipped'){ $status.text('Alert cleared. (Password-protected posts aren’t scanned.)'); }
+        else { $status.text('Alert cleared — showing the last successful scan.'); }
+      } else {
+        $status.text((d && d.message) ? d.message : 'Could not clear the alert.');
+      }
+    }).fail(function(){
+      $status.text('Could not clear the alert.');
+    }).always(function(){
+      $clr.prop('disabled', false);
+    });
+  });
+
+  /* ---- Reports: clear ALL stored error alerts (batched — safe on big backlogs) ---- */
+  $(document).on('click', '.ogm-eqa-clear-all-errors', function(e){
+    e.preventDefault();
+    if(!window.confirm('Clear the stored error alert on every post you can edit? Reports and issue counts are kept.')) return;
+    var $b = $(this);
+    var $s = $('.ogm-eqa-clear-all-status').first();
+    var total = 0;
+    $b.prop('disabled', true);
+    $s.text('Clearing…');
+
+    function batch(){
+      $.post(OGM_EQA.ajax_url, {
+        action: 'ogm_eqa_clear_all_errors',
+        nonce: OGM_EQA.clear_all_nonce
+      }).done(function(resp){
+        if(resp && resp.success && resp.data){
+          total += resp.data.cleared || 0;
+          if((resp.data.remaining || 0) > 0 && (resp.data.cleared || 0) > 0){
+            $s.text('Cleared ' + total + ' so far…');
+            batch();
+            return;
+          }
+          var msg = 'Cleared ' + total + ' alert' + (total === 1 ? '' : 's') + '.';
+          if(resp.data.skipped){ msg += ' (' + resp.data.skipped + ' skipped — no edit rights.)'; }
+          $s.text(msg + ' Reloading…');
+          window.location.reload();
+        } else {
+          $s.text('Could not clear alerts.');
+          $b.prop('disabled', false);
+        }
+      }).fail(function(){
+        $s.text('Could not clear alerts.');
+        $b.prop('disabled', false);
+      });
+    }
+    batch();
+  });
 
   /* ---- Settings: reset the scan-instructions textarea to the default ---- */
   $(document).on('click', '.ogm-eqa-reset-instructions', function(e){
